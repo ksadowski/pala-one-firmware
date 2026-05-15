@@ -37,6 +37,11 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 #include <esp_heap_caps.h>
 #include <soc/soc.h>
 
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
 // ============================================================================
 //  Firmware / Product constants
 // ============================================================================
@@ -68,6 +73,14 @@ static const uint32_t UPLOAD_AUTO_EXIT_MS = 15UL * 60UL * 1000UL;
 static const uint32_t BAT_CACHE_MS = 180000; // 3 min — battery changes slowly
 
 static const int FULL_REFRESH_EVERY_N_PAGES = 100;
+
+// ============================================================================
+//  BLE Service / Characteristic UUIDs
+// ============================================================================
+#define PALA_BLE_SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define PALA_BLE_CHAR_CMD_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define PALA_BLE_CHAR_DATA_UUID      "beb5483f-36e1-4688-b7f5-ea07361b26a8"
+#define PALA_BLE_CHAR_STATUS_UUID    "beb54840-36e1-4688-b7f5-ea07361b26a8"
 static const int MENU_FULL_REFRESH_EVERY = 60;
 
 static const int MARGIN_X = 6;
@@ -332,6 +345,27 @@ static size_t    g_appExecSize = 0;
 LayoutMetrics g_metrics;
 bool g_metricsValid = false;
 
+// BLE globals
+static BLEServer* g_bleServer = nullptr;
+static BLECharacteristic* g_bleCharCmd = nullptr;
+static BLECharacteristic* g_bleCharData = nullptr;
+static BLECharacteristic* g_bleCharStatus = nullptr;
+static bool g_bleConnected = false;
+
+// BLE file transfer state
+enum BLETransferState {
+  BLE_TRANSFER_IDLE,
+  BLE_TRANSFER_UPLOADING,
+  BLE_TRANSFER_DOWNLOADING
+};
+static BLETransferState g_bleTransferState = BLE_TRANSFER_IDLE;
+static File g_bleTransferFile;
+static String g_bleTransferPath;
+static uint32_t g_bleTransferOffset = 0;
+static uint32_t g_bleTransferTotalSize = 0;
+static uint32_t g_bleTransferBytesSent = 0;
+static const uint32_t BLE_CHUNK_SIZE = 512; // Safe chunk size for BLE
+
 static char AP_SSID[24] = "PALA-";
 static const char* AP_PASS = "palaread";
 
@@ -374,6 +408,10 @@ static void loadSettings();
 static void markUserActivity();
 static void clearButtonQueue();
 static void resetInputFrontend();
+
+static void setupBLE();
+static void handleBLECommand(std::string cmd);
+static void sendBLEStatus(const char* msg);
 
 static bool fsBegin();
 static void ensureBooksDir();
@@ -433,6 +471,480 @@ static size_t fsFreeBytesSafe() {
 
 static void invalidateMetrics() {
   g_metricsValid = false;
+}
+
+// ============================================================================
+//  BLE Server Setup
+// ============================================================================
+class PalaBLEServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    g_bleConnected = true;
+    sendBLEStatus("connected");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    g_bleConnected = false;
+    sendBLEStatus("disconnected");
+    // Restart advertising after disconnect
+    BLEDevice::startAdvertising();
+  }
+};
+
+class BLECommandCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    std::string cmd = std::string(pCharacteristic->getValue().c_str());
+    if (cmd.length() > 0) {
+      handleBLECommand(cmd);
+    }
+  }
+};
+
+class BLEDataCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    if (g_bleTransferState == BLE_TRANSFER_UPLOADING && g_bleTransferFile) {
+      std::string data = std::string(pCharacteristic->getValue().c_str());
+      if (data.length() > 0) {
+        g_bleTransferFile.write((const uint8_t*)data.c_str(), data.length());
+        g_bleTransferOffset += data.length();
+
+        // Send ACK with offset
+        String ack = "ACK:" + String(g_bleTransferOffset);
+        sendBLEStatus(ack.c_str());
+
+        // Check if transfer complete
+        if (g_bleTransferOffset >= g_bleTransferTotalSize) {
+          g_bleTransferFile.close();
+          g_bleTransferState = BLE_TRANSFER_IDLE;
+
+          // Apply normalization like HTTP upload
+          String tmpPath = g_bleTransferPath + ".tmp";
+          String finalPath = g_bleTransferPath;
+
+          // Read, normalize, and rewrite file
+          File tmpFile = FS.open(tmpPath, "r");
+          if (tmpFile) {
+            String normalized;
+            normalized.reserve(g_bleTransferTotalSize + 8);
+            while (tmpFile.available()) {
+              String chunk = tmpFile.readStringUntil('\n');
+              chunk += '\n';
+              String cleaned = normalizeTypography(chunk);
+              cleaned = compactText(cleaned);
+              normalized += cleaned;
+            }
+            tmpFile.close();
+
+            // Write normalized content to final file
+            File finalFile = FS.open(finalPath, "w");
+            if (finalFile) {
+              finalFile.print(normalized);
+              finalFile.close();
+              FS.remove(tmpPath);
+              sendBLEStatus("upload_complete");
+
+              // Reload library after upload
+              loadBooks();
+            } else {
+              FS.remove(tmpPath);
+              sendBLEStatus("upload_error:cannot_finalize");
+            }
+          } else {
+            FS.remove(tmpPath);
+            sendBLEStatus("upload_error:cannot_read_tmp");
+          }
+        }
+      }
+    }
+  }
+};
+
+static void sendBLEStatus(const char* msg) {
+  if (g_bleCharStatus && g_bleConnected) {
+    g_bleCharStatus->setValue(msg);
+    g_bleCharStatus->notify();
+  }
+}
+
+static void handleBLECommand(std::string cmd) {
+  // Parse command and route to appropriate handler
+  // Commands: "LIST_FILES", "UPLOAD:<path>", "DOWNLOAD:<path>", "GET_SETTINGS", "SET_SETTINGS:...", etc.
+  Serial.print("[BLE] Command: ");
+  Serial.println(cmd.c_str());
+
+  String command(cmd.c_str());
+  command.trim();
+
+  if (command == "LIST_FILES") {
+    // Return JSON list of books
+    String json = "[";
+    bool first = true;
+    for (int i = 0; i < g_library.bookCount; i++) {
+      if (!first) json += ",";
+      first = false;
+      json += "{\"name\":\"" + String(g_library.books[i].name) + "\",";
+      json += "\"path\":\"" + String(g_library.books[i].path) + "\",";
+      json += "\"size\":" + String(g_library.books[i].size) + "}";
+    }
+    json += "]";
+    if (g_bleCharData && g_bleConnected) {
+      g_bleCharData->setValue(json.c_str());
+      g_bleCharData->notify();
+    }
+    sendBLEStatus("list_sent");
+  }
+  else if (command.startsWith("UPLOAD:")) {
+    String params = command.substring(7);
+    // Parse: UPLOAD:/books/filename.txt:12345 (path:size)
+    int colonIdx = params.indexOf(':', 1); // Skip the first colon after UPLOAD:
+    if (colonIdx > 0) {
+      String path = params.substring(0, colonIdx);
+      uint32_t size = params.substring(colonIdx + 1).toInt();
+
+      if (size > 0 && size < 10 * 1024 * 1024) { // Max 10MB
+        // Check free space
+        size_t freeBytes = fsFreeBytesSafe();
+        if (freeBytes < size + 8192) {
+          sendBLEStatus("upload_error:no_space");
+          return;
+        }
+
+        // Open file for writing
+        String tmpPath = path + ".tmp";
+        if (FS.exists(tmpPath)) FS.remove(tmpPath);
+        g_bleTransferFile = FS.open(tmpPath, "w");
+
+        if (g_bleTransferFile) {
+          g_bleTransferPath = path;
+          g_bleTransferOffset = 0;
+          g_bleTransferTotalSize = size;
+          g_bleTransferBytesSent = 0;
+          g_bleTransferState = BLE_TRANSFER_UPLOADING;
+          sendBLEStatus("upload_ready");
+        } else {
+          sendBLEStatus("upload_error:cannot_open");
+        }
+      } else {
+        sendBLEStatus("upload_error:invalid_size");
+      }
+    } else {
+      sendBLEStatus("upload_error:invalid_params");
+    }
+  }
+  else if (command.startsWith("DOWNLOAD:")) {
+    String path = command.substring(9);
+    if (FS.exists(path)) {
+      g_bleTransferFile = FS.open(path, "r");
+      if (g_bleTransferFile) {
+        g_bleTransferPath = path;
+        g_bleTransferOffset = 0;
+        g_bleTransferTotalSize = g_bleTransferFile.size();
+        g_bleTransferBytesSent = 0;
+        g_bleTransferState = BLE_TRANSFER_DOWNLOADING;
+
+        // Send file size to client
+        String sizeMsg = "DOWNLOAD_READY:" + String(g_bleTransferTotalSize);
+        sendBLEStatus(sizeMsg.c_str());
+      } else {
+        sendBLEStatus("download_error:cannot_open");
+      }
+    } else {
+      sendBLEStatus("download_error:not_found");
+    }
+  }
+  else if (command == "DOWNLOAD_NEXT_CHUNK") {
+    // Send next chunk of file
+    if (g_bleTransferState == BLE_TRANSFER_DOWNLOADING && g_bleTransferFile) {
+      uint8_t chunk[BLE_CHUNK_SIZE];
+      g_bleTransferFile.seek(g_bleTransferOffset);
+      int bytesRead = g_bleTransferFile.read(chunk, BLE_CHUNK_SIZE);
+
+      if (bytesRead > 0) {
+        g_bleCharData->setValue(chunk, bytesRead);
+        g_bleCharData->notify();
+        g_bleTransferOffset += bytesRead;
+
+        // Check if complete
+        if (g_bleTransferOffset >= g_bleTransferTotalSize) {
+          g_bleTransferFile.close();
+          g_bleTransferState = BLE_TRANSFER_IDLE;
+          sendBLEStatus("download_complete");
+        } else {
+          // Send offset as status
+          String offsetMsg = "CHUNK_SENT:" + String(g_bleTransferOffset);
+          sendBLEStatus(offsetMsg.c_str());
+        }
+      } else {
+        g_bleTransferFile.close();
+        g_bleTransferState = BLE_TRANSFER_IDLE;
+        sendBLEStatus("download_error:read_failed");
+      }
+    } else {
+      sendBLEStatus("download_error:not_active");
+    }
+  }
+  else if (command == "GET_SETTINGS") {
+    // Return current settings as JSON
+    String json = "{";
+    json += "\"fontSize\":" + String(g_settings.fontSize) + ",";
+    json += "\"sleepSecs\":" + String(g_settings.sleepSecs) + ",";
+    json += "\"lineGap\":" + String(g_settings.lineGap) + ",";
+    json += "\"readerLongPressAction\":" + String(g_settings.readerLongPressAction);
+    json += "}";
+    if (g_bleCharData && g_bleConnected) {
+      g_bleCharData->setValue(json.c_str());
+      g_bleCharData->notify();
+    }
+    sendBLEStatus("settings_sent");
+  }
+  else if (command.startsWith("SET_SETTINGS:")) {
+    String settingsJson = command.substring(13);
+    // Simple JSON parsing: {"fontSize":10,"sleepSecs":120,"lineGap":0}
+    bool layoutChanged = false;
+
+    // Parse fontSize
+    int fsIdx = settingsJson.indexOf("\"fontSize\":");
+    if (fsIdx >= 0) {
+      int valStart = fsIdx + 11;
+      int valEnd = settingsJson.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = settingsJson.indexOf('}', valStart);
+      if (valEnd > valStart) {
+        int fs = settingsJson.substring(valStart, valEnd).toInt();
+        if (fs == 8 || fs == 10 || fs == 12 || fs == 14) {
+          if (fs != g_settings.fontSize) {
+            applyFontSize(fs);
+            prefs.putInt("cfg_font", fs);
+            layoutChanged = true;
+          }
+        }
+      }
+    }
+
+    // Parse sleepSecs
+    int ssIdx = settingsJson.indexOf("\"sleepSecs\":");
+    if (ssIdx >= 0) {
+      int valStart = ssIdx + 12;
+      int valEnd = settingsJson.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = settingsJson.indexOf('}', valStart);
+      if (valEnd > valStart) {
+        int ss = settingsJson.substring(valStart, valEnd).toInt();
+        if (ss >= 10 && ss <= 3600) {
+          if ((uint32_t)ss != g_settings.sleepSecs) {
+            g_settings.sleepSecs = (uint32_t)ss;
+            prefs.putInt("cfg_sleep", ss);
+          }
+        }
+      }
+    }
+
+    // Parse lineGap
+    int lgIdx = settingsJson.indexOf("\"lineGap\":");
+    if (lgIdx >= 0) {
+      int valStart = lgIdx + 10;
+      int valEnd = settingsJson.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = settingsJson.indexOf('}', valStart);
+      if (valEnd > valStart) {
+        int lg = settingsJson.substring(valStart, valEnd).toInt();
+        if (lg >= 0 && lg <= 4) {
+          if (lg != g_settings.lineGap) {
+            g_settings.lineGap = lg;
+            prefs.putInt("cfg_lgap", lg);
+            invalidateMetrics();
+            layoutChanged = true;
+          }
+        }
+      }
+    }
+
+    if (layoutChanged) {
+      invalidateAllPageCaches();
+    }
+    sendBLEStatus("settings_updated");
+  }
+  else if (command.startsWith("GET_BOOKMARKS:")) {
+    String path = command.substring(14);
+    String key = prefKeyForBook(path);
+    uint16_t pages[MAX_BOOKMARKS];
+    uint32_t offsets[MAX_BOOKMARKS];
+    uint8_t count = loadBookmarksForKey(key, pages, offsets);
+    String json = "{\"book\":\"" + path + "\",\"bookmarks\":[";
+    for (uint8_t i = 0; i < count; i++) {
+      if (i > 0) json += ",";
+      json += "{\"page\":" + String(pages[i]) + ",\"offset\":" + String(offsets[i]) + "}";
+    }
+    json += "]}";
+    if (g_bleCharData && g_bleConnected) {
+      g_bleCharData->setValue(json.c_str());
+      g_bleCharData->notify();
+    }
+    sendBLEStatus("bookmarks_sent");
+  }
+  else if (command.startsWith("ADD_BOOKMARK:")) {
+    String bookmarkJson = command.substring(13);
+    // Parse JSON: {"path":"/books/...","page":42}
+    int pathIdx = bookmarkJson.indexOf("\"path\":\"");
+    int pageIdx = bookmarkJson.indexOf("\"page\":");
+    if (pathIdx >= 0 && pageIdx >= 0) {
+      int pathStart = pathIdx + 8;
+      int pathEnd = bookmarkJson.indexOf('"', pathStart);
+      int pageStart = pageIdx + 7;
+      int pageEnd = bookmarkJson.indexOf(',', pageStart);
+      if (pageEnd < 0) pageEnd = bookmarkJson.indexOf('}', pageStart);
+
+      if (pathEnd > pathStart && pageEnd > pageStart) {
+        String path = bookmarkJson.substring(pathStart, pathEnd);
+        int page = bookmarkJson.substring(pageStart, pageEnd).toInt();
+        String key = prefKeyForBook(path);
+
+        uint16_t pages[MAX_BOOKMARKS];
+        uint32_t offsets[MAX_BOOKMARKS];
+        uint8_t count = loadBookmarksForKey(key, pages, offsets);
+
+        // Check if bookmark already exists
+        bool exists = false;
+        for (uint8_t i = 0; i < count; i++) {
+          if ((int)pages[i] == page) {
+            exists = true;
+            break;
+          }
+        }
+
+        if (!exists && count < MAX_BOOKMARKS) {
+          pages[count] = (uint16_t)page;
+          offsets[count] = 0xFFFFFFFFUL; // Will be resolved on access
+          count++;
+          saveBookmarksForKey(key, pages, offsets, count);
+          sendBLEStatus("bookmark_added");
+        } else if (exists) {
+          sendBLEStatus("bookmark_exists");
+        } else {
+          sendBLEStatus("bookmarks_full");
+        }
+      } else {
+        sendBLEStatus("invalid_json");
+      }
+    } else {
+      sendBLEStatus("invalid_json");
+    }
+  }
+  else if (command.startsWith("DELETE_BOOKMARK:")) {
+    String bookmarkJson = command.substring(16);
+    // Parse JSON: {"path":"/books/...","page":42}
+    int pathIdx = bookmarkJson.indexOf("\"path\":\"");
+    int pageIdx = bookmarkJson.indexOf("\"page\":");
+    if (pathIdx >= 0 && pageIdx >= 0) {
+      int pathStart = pathIdx + 8;
+      int pathEnd = bookmarkJson.indexOf('"', pathStart);
+      int pageStart = pageIdx + 7;
+      int pageEnd = bookmarkJson.indexOf(',', pageStart);
+      if (pageEnd < 0) pageEnd = bookmarkJson.indexOf('}', pageStart);
+
+      if (pathEnd > pathStart && pageEnd > pageStart) {
+        String path = bookmarkJson.substring(pathStart, pathEnd);
+        int page = bookmarkJson.substring(pageStart, pageEnd).toInt();
+        String key = prefKeyForBook(path);
+
+        uint16_t pages[MAX_BOOKMARKS];
+        uint32_t offsets[MAX_BOOKMARKS];
+        uint8_t count = loadBookmarksForKey(key, pages, offsets);
+
+        // Find and remove bookmark
+        bool found = false;
+        for (uint8_t i = 0; i < count; i++) {
+          if ((int)pages[i] == page) {
+            found = true;
+            // Shift remaining bookmarks
+            for (uint8_t j = i; j < count - 1; j++) {
+              pages[j] = pages[j + 1];
+              offsets[j] = offsets[j + 1];
+            }
+            count--;
+            saveBookmarksForKey(key, pages, offsets, count);
+            break;
+          }
+        }
+
+        if (found) {
+          sendBLEStatus("bookmark_deleted");
+        } else {
+          sendBLEStatus("bookmark_not_found");
+        }
+      } else {
+        sendBLEStatus("invalid_json");
+      }
+    } else {
+      sendBLEStatus("invalid_json");
+    }
+  }
+  else if (command == "CANCEL_TRANSFER") {
+    if (g_bleTransferState != BLE_TRANSFER_IDLE) {
+      if (g_bleTransferFile) g_bleTransferFile.close();
+
+      // Clean up temp file if upload was in progress
+      if (g_bleTransferState == BLE_TRANSFER_UPLOADING) {
+        String tmpPath = g_bleTransferPath + ".tmp";
+        if (FS.exists(tmpPath)) FS.remove(tmpPath);
+      }
+
+      g_bleTransferState = BLE_TRANSFER_IDLE;
+      g_bleTransferPath = "";
+      g_bleTransferOffset = 0;
+      g_bleTransferTotalSize = 0;
+      g_bleTransferBytesSent = 0;
+      sendBLEStatus("transfer_cancelled");
+    } else {
+      sendBLEStatus("no_active_transfer");
+    }
+  }
+  else {
+    sendBLEStatus("unknown_command");
+  }
+}
+
+static void setupBLE() {
+  // Initialize BLE
+  Serial.println("[BLE] Initializing BLE...");
+  BLEDevice::init("Pala One");
+  Serial.println("[BLE] Device name set to 'Pala One'");
+
+  // Create BLE server
+  g_bleServer = BLEDevice::createServer();
+  g_bleServer->setCallbacks(new PalaBLEServerCallbacks());
+  Serial.println("[BLE] Server created");
+
+  // Create BLE service
+  BLEService* pService = g_bleServer->createService(PALA_BLE_SERVICE_UUID);
+
+  // Create characteristics
+  g_bleCharCmd = pService->createCharacteristic(
+    PALA_BLE_CHAR_CMD_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  g_bleCharCmd->setCallbacks(new BLECommandCallbacks());
+
+  g_bleCharData = pService->createCharacteristic(
+    PALA_BLE_CHAR_DATA_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  g_bleCharData->setCallbacks(new BLEDataCallbacks());
+  g_bleCharData->addDescriptor(new BLE2902());
+
+  g_bleCharStatus = pService->createCharacteristic(
+    PALA_BLE_CHAR_STATUS_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  g_bleCharStatus->addDescriptor(new BLE2902());
+
+  // Start service
+  pService->start();
+  Serial.println("[BLE] Service started");
+
+  // Start advertising
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(PALA_BLE_SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  Serial.println("[BLE] Advertising started");
 }
 
 static const LayoutMetrics& getMetrics() {
@@ -4375,6 +4887,9 @@ void setup() {
 
   display.fastmodeOff();
   display.clear();
+
+  // Initialize BLE server
+  setupBLE();
 
   if (!fsBegin()) {
     drawCenter("Storage error", "Try factory reset");
