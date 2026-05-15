@@ -2,7 +2,7 @@
 
 // ── Board selection: uncomment the line that matches your hardware ────────────
 //#define BOARD_V1_1
-// #define BOARD_V1_2
+#define BOARD_V1_2
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "pala_app.h"
@@ -1413,6 +1413,7 @@ static String normalizeTypography(const String& in) {
     // 0xC2 0xBB = U+00BB >>  (right guillemet)
     if (b0 == 0xC2 && i + 1 < in.length()) {
       uint8_t b1 = (uint8_t)in[i + 1];
+      if (b1 == 0xAD) { i += 2; continue; } // soft hyphen (U+00AD) — discard
       if (b1 == 0xAB || b1 == 0xBB) { out += '"'; i += 2; continue; }
       // 0x91/0x92 are valid UTF-8 continuation bytes after 0xC2 (U+00D1, U+00D2)
       // but not quote chars. Leave the old 0x91/0x92 branch: those are
