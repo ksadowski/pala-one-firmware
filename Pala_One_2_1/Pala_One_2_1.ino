@@ -355,6 +355,11 @@ static bool g_switchToLibrary = false;
 // Deferred redraw flag for settings refresh
 static bool g_redrawCurrentMode = false;
 static bool g_fetchAllBookmarks = false;
+static bool g_extractWordBeforeSettings = false;
+static String g_savedWordSegment = "";
+static bool g_searchWordAfterSettings = false;
+static int g_savedPageIndex = 0;
+static int g_savedFontSize = 0;
 
 // Deferred upload initialization flags
 static bool g_initUpload = false;
@@ -857,6 +862,19 @@ static void handleBLECommand(std::string cmd) {
     String settingsJson = command.substring(13);
     // Simple JSON parsing: {"fontSize":10,"sleepSecs":120,"lineGap":0}
     bool layoutChanged = false;
+    bool wasReading = (mode == MODE_READER) && g_reader.file;
+
+    // Clear any pending word extraction/search from previous settings change
+    g_extractWordBeforeSettings = false;
+    g_searchWordAfterSettings = false;
+    g_savedWordSegment = "";
+
+    Serial.print("[BLE] Settings before: fontSize=");
+    Serial.print(g_settings.fontSize);
+    Serial.print(", sleepSecs=");
+    Serial.print(g_settings.sleepSecs);
+    Serial.print(", lineGap=");
+    Serial.println(g_settings.lineGap);
 
     // Parse fontSize
     int fsIdx = settingsJson.indexOf("\"fontSize\":");
@@ -868,9 +886,15 @@ static void handleBLECommand(std::string cmd) {
         int fs = settingsJson.substring(valStart, valEnd).toInt();
         if (fs == 8 || fs == 10 || fs == 12 || fs == 14) {
           if (fs != g_settings.fontSize) {
+            // Save original font size before applying change
+            if (wasReading && layoutChanged == false) {
+              g_savedFontSize = g_settings.fontSize;
+            }
             applyFontSize(fs);
             prefs.putInt("cfg_font", fs);
             layoutChanged = true;
+            Serial.print("[BLE] Attempt started: changing fontSize to ");
+            Serial.println(fs);
           }
         }
       }
@@ -912,8 +936,27 @@ static void handleBLECommand(std::string cmd) {
       }
     }
 
+    // Only trigger word extraction if layout actually changed
+    if (layoutChanged && wasReading) {
+      // Save current page index before layout invalidation
+      g_savedPageIndex = g_reader.pageIndex;
+      g_extractWordBeforeSettings = true;
+      Serial.print("[BLE] Layout changed, saving page index: ");
+      Serial.print(g_savedPageIndex);
+      Serial.print(", font size: ");
+      Serial.println(g_savedFontSize);
+    }
+
     if (layoutChanged) {
       invalidateAllPageCaches();
+      // Trigger word search after settings change
+      if (wasReading) {
+        g_searchWordAfterSettings = true;
+        Serial.println("[BLE] Will search for word segment after settings change");
+      } else {
+        Serial.print("[BLE] Attempt succeeded: fontSize updated to ");
+        Serial.println(g_settings.fontSize);
+      }
     }
     sendBLEStatus("settings_updated");
 
@@ -1985,6 +2028,12 @@ static void scanBooksRecursive(const String& absDir, const String& relDir) {
     String leaf = lastPathComponent(absPath);
 
     if (f.isDirectory()) {
+      // Skip .progress directory
+      if (leaf == ".progress") {
+        f.close();
+        f = dir.openNextFile();
+        continue;
+      }
       String childRel = relDir.length() ? (relDir + "/" + leaf) : leaf;
       addFolderIfMissing(childRel);
       scanBooksRecursive(absPath, childRel);
@@ -2367,16 +2416,77 @@ static inline void resetSaveThrottle() {
   g_reader.lastSavedPage = -1;
 }
 
-static void saveProgressThrottled(bool force = false) {
-  if (g_reader.currentBookKey.length() == 0) return;
+static void saveProgress(bool force) {
+  if (!g_reader.file) return;
 
   if (!force) {
     if (g_reader.pageIndex == g_reader.lastSavedPage) return;
-    uint32_t now = millis();
-    if (g_reader.lastSaveMs != 0 && (now - g_reader.lastSaveMs) < SAVE_EVERY_MS) return;
   }
 
-  prefs.putInt((g_reader.currentBookKey + "_p").c_str(), g_reader.pageIndex);
+  Serial.print("[Progress] Saving progress for book: ");
+  Serial.print(g_reader.currentBookKey);
+  Serial.print(", page: ");
+  Serial.println(g_reader.pageIndex);
+
+  // Save page index to filesystem
+  String progressPath = "/books/.progress/" + g_reader.currentBookKey + ".txt";
+  FS.remove(progressPath.c_str());
+  File f = FS.open(progressPath.c_str(), "w");
+  if (f) {
+    f.println(g_reader.pageIndex);
+    f.close();
+  }
+  
+  // Extract and save 2-word segment for precise position restoration
+  String segmentPath = "/books/.progress/" + g_reader.currentBookKey + "_seg.txt";
+  FS.remove(segmentPath.c_str());
+  File segFile = FS.open(segmentPath.c_str(), "w");
+  if (segFile) {
+    // Extract first 2 words from current page using same method as font change
+    String txt;
+    txt.reserve(900);
+    uint32_t currentOffset = g_reader.pageOffsets[g_reader.pageIndex];
+    g_reader.file.seek(currentOffset);
+    readPageFromFile(g_reader.file, currentOffset, false, &txt);
+    txt.trim();
+    
+    // Extract first 2 words (accept UTF-8 characters, skip whitespace only)
+    String wordSegment = "";
+    int wordCount = 0;
+    bool inWord = false;
+    
+    for (int i = 0; i < txt.length() && wordCount < 2; i++) {
+      char c = txt.charAt(i);
+      // Accept any character except whitespace
+      if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+        wordSegment += c;
+        inWord = true;
+      } else {
+        if (inWord) {
+          wordSegment += " ";
+          wordCount++;
+          inWord = false;
+        }
+      }
+    }
+    
+    // Remove trailing space if any
+    if (wordSegment.endsWith(" ")) {
+      wordSegment = wordSegment.substring(0, wordSegment.length() - 1);
+    }
+    
+    if (wordSegment.length() > 0) {
+      segFile.print(wordSegment);
+      Serial.print("[Progress] Saved word segment: ");
+      Serial.println(wordSegment);
+    } else {
+      Serial.println("[Progress] Could not extract word segment from page");
+    }
+    segFile.close();
+  } else {
+    Serial.println("[Progress] Could not open segment file for writing");
+  }
+  
   g_reader.lastSaveMs = millis();
   g_reader.lastSavedPage = g_reader.pageIndex;
 }
@@ -2958,8 +3068,96 @@ static bool openBookByIndex(int idx) {
   g_reader.pageOffsets[0] = 0;
   g_reader.eofReached = false;
   loadPageOffsetCacheForBook(path, g_reader.file.size());
-  g_reader.pageIndex = prefs.getInt((g_reader.currentBookKey + "_p").c_str(), 0);
-  if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
+  
+  // Load page index from filesystem
+  String progressPath = "/books/.progress/" + g_reader.currentBookKey + ".txt";
+  File progressFile = FS.open(progressPath.c_str(), "r");
+  if (progressFile) {
+    String pageStr = progressFile.readStringUntil('\n');
+    g_reader.pageIndex = pageStr.toInt();
+    progressFile.close();
+    if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
+    Serial.print("[Progress] Restored page index: ");
+    Serial.println(g_reader.pageIndex);
+  } else {
+    g_reader.pageIndex = 0;
+    Serial.println("[Progress] No saved progress, starting at page 0");
+  }
+  
+  // Load 2-word segment and search for precise position
+  String segmentPath = "/books/.progress/" + g_reader.currentBookKey + "_seg.txt";
+  File segFile = FS.open(segmentPath.c_str(), "r");
+  if (segFile) {
+    String wordSegment = segFile.readString();
+    segFile.close();
+    wordSegment.trim();  // Remove any trailing whitespace
+    
+    if (wordSegment.length() > 0) {
+      Serial.print("[Progress] Found saved word segment: ");
+      Serial.println(wordSegment);
+      
+      int currentPage = g_reader.pageIndex;
+      int targetPage = currentPage;
+      bool found = false;
+      
+      // Search range: 10 pages before and after saved page
+      int searchStart = max(0, currentPage - 10);
+      int searchEnd = min(MAX_PAGES - 1, currentPage + 10);
+      
+      Serial.print("[Restore] Searching around page ");
+      Serial.print(currentPage);
+      Serial.print(" (range ");
+      Serial.print(searchStart);
+      Serial.print(" to ");
+      Serial.print(searchEnd);
+      Serial.println(")");
+      
+      // Compute page offsets up to search end
+      ensureOffsetsUpTo(searchEnd + 1);
+      
+      // Search from start of range to end
+      for (int i = searchStart; i <= searchEnd && !found; i++) {
+        String txt;
+        txt.reserve(900);
+        uint32_t filePos = g_reader.pageOffsets[i];
+        if (filePos >= g_reader.file.size()) break;
+        g_reader.file.seek(filePos);
+        readPageFromFile(g_reader.file, filePos, false, &txt);
+        txt.trim();
+        
+        Serial.print("[Restore] Page ");
+        Serial.print(i);
+        Serial.print(" text: ");
+        Serial.println(txt);
+        Serial.print("[Restore] Looking for: '");
+        Serial.print(wordSegment);
+        Serial.println("'");
+        Serial.print("[Restore] indexOf result: ");
+        Serial.println(txt.indexOf(wordSegment));
+        
+        if (txt.indexOf(wordSegment) >= 0) {
+          found = true;
+          targetPage = i;
+          Serial.print("[Restore] Found word segment on page ");
+          Serial.println(targetPage);
+          break;
+        }
+      }
+      
+      if (found) {
+        g_reader.pageIndex = targetPage;
+        Serial.print("[Progress] Position restored using word segment to page ");
+        Serial.println(g_reader.pageIndex);
+      } else {
+        Serial.println("[Progress] Word segment not found, using saved page index");
+      }
+    } else {
+      Serial.println("[Progress] No saved word segment");
+    }
+  } else {
+    Serial.println("[Progress] No saved word segment file");
+  }
+  
   g_reader.pageTurnsSinceFull = 0;
   resetSaveThrottle();
   syncWakeState(true);
@@ -3872,11 +4070,11 @@ static void goToSleep() {
   if (g_bookmarkUi.previewActive) {
     int tmpPage = g_reader.pageIndex;
     g_reader.pageIndex = g_bookmarkUi.previewSavedPage;
-    saveProgressThrottled(true);
+    saveProgress(true);
     if (g_reader.file) savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
     g_reader.pageIndex = tmpPage;
   } else if (mode == MODE_READER) {
-    saveProgressThrottled(true);
+    saveProgress(true);
     if (g_reader.file) savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
   }
 
@@ -3933,6 +4131,7 @@ void setup() {
   }
   ensureBooksDir();
   if (!FS.exists("/apps")) FS.mkdir("/apps");
+  if (!FS.exists("/books/.progress")) FS.mkdir("/books/.progress");
 
   prefs.begin("ereader", false);
   loadSettings();
@@ -4100,7 +4299,7 @@ static void handleModeBookmarkPreview() {
   if (btns.longClick) {
     // Long-press = accept this bookmark position, continue reading from here
     g_bookmarkUi.previewActive = false;
-    saveProgressThrottled(true);
+    saveProgress(true);
     if (g_reader.file) savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
     mode = MODE_READER;
     renderCurrentPage();
@@ -4242,9 +4441,9 @@ static void handleModeReader() {
   if (btns.doubleClick) {
     if (g_reader.pageIndex > 0) {
       g_reader.pageIndex--;
-      saveProgressThrottled(false);
       g_reader.pageTurnsSinceFull++;
       renderCurrentPage();
+      saveProgress(false);  // Save after rendering to ensure correct page
     }
     return;
   }
@@ -4256,9 +4455,9 @@ static void handleModeReader() {
     if (g_reader.eofReached && g_reader.pageIndex >= g_reader.knownPages) g_reader.pageIndex = g_reader.knownPages - 1;
     if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
     if (g_reader.pageIndex != oldPage) {
-      saveProgressThrottled(false);
       g_reader.pageTurnsSinceFull++;
       renderCurrentPage();
+      saveProgress(false);  // Save after rendering to ensure correct page
     }
     return;
   }
@@ -4328,6 +4527,143 @@ void loop() {
       default: break;
     }
     g_redrawCurrentMode = false;
+  }
+
+  // Handle word extraction before settings change
+  if (g_extractWordBeforeSettings && mode == MODE_READER && g_reader.file) {
+    Serial.println("[BLE] Extracting word segment before settings change");
+    
+    String txt;
+    txt.reserve(900);
+    uint32_t currentOffset = g_reader.lastPageStartOffset;
+    g_reader.file.seek(currentOffset);
+    readPageFromFile(g_reader.file, currentOffset, false, &txt);
+    txt.trim();
+    
+    // Extract first 2 words (accept UTF-8 characters, skip whitespace only)
+    String wordSegment = "";
+    int wordCount = 0;
+    bool inWord = false;
+    
+    for (int i = 0; i < txt.length() && wordCount < 2; i++) {
+      char c = txt.charAt(i);
+      // Accept any character except whitespace
+      if (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+        wordSegment += c;
+        inWord = true;
+      } else {
+        // Whitespace - if we were in a word, we finished it
+        if (inWord) {
+          wordSegment += " ";
+          wordCount++;
+          inWord = false;
+        }
+        // Skip whitespace
+      }
+    }
+    
+    // Remove trailing space if any
+    if (wordSegment.endsWith(" ")) {
+      wordSegment = wordSegment.substring(0, wordSegment.length() - 1);
+    }
+    
+    if (wordSegment.length() > 0) {
+      g_savedWordSegment = wordSegment;
+      Serial.print("[BLE] Saved word segment: ");
+      Serial.println(wordSegment);
+    }
+    
+    g_extractWordBeforeSettings = false;
+  }
+
+  // Handle word search after settings change
+  if (g_searchWordAfterSettings && mode == MODE_READER && g_reader.file) {
+    Serial.print("[BLE] Searching for word segment: ");
+    Serial.println(g_savedWordSegment);
+    
+    if (g_savedWordSegment.length() > 0) {
+      String searchWord = g_savedWordSegment;
+      int currentPage = g_savedPageIndex; // Use saved page index instead of current
+      int targetPage = 0;
+      bool found = false;
+      
+      // Search range: 100 pages before and after saved page
+      int searchStart = max(0, currentPage - 100);
+      int searchEnd = min(MAX_PAGES - 1, currentPage + 100);
+      
+      Serial.print("[BLE] Searching around page ");
+      Serial.print(currentPage);
+      Serial.print(" (range ");
+      Serial.print(searchStart);
+      Serial.print(" to ");
+      Serial.print(searchEnd);
+      Serial.println(")");
+      
+      // Compute page offsets up to search end
+      ensureOffsetsUpTo(searchEnd + 1);
+      
+      // Search forward from saved page
+      for (int i = currentPage; i <= searchEnd && !found; i++) {
+        String txt;
+        txt.reserve(900);
+        uint32_t filePos = g_reader.pageOffsets[i];
+        if (filePos >= g_reader.file.size()) break;
+        g_reader.file.seek(filePos);
+        readPageFromFile(g_reader.file, filePos, false, &txt);
+        txt.trim();
+        
+        if (txt.indexOf(searchWord) >= 0) {
+          found = true;
+          targetPage = i;
+          Serial.print("[BLE] Found word segment on page ");
+          Serial.println(targetPage);
+          break;
+        }
+      }
+      
+      // If not found forward, search backward from saved page
+      if (!found) {
+        for (int i = currentPage - 1; i >= searchStart && !found; i--) {
+          String txt;
+          txt.reserve(900);
+          uint32_t filePos = g_reader.pageOffsets[i];
+          if (filePos >= g_reader.file.size()) break;
+          g_reader.file.seek(filePos);
+          readPageFromFile(g_reader.file, filePos, false, &txt);
+          txt.trim();
+          
+          if (txt.indexOf(searchWord) >= 0) {
+            found = true;
+            targetPage = i;
+            Serial.print("[BLE] Found word segment on page ");
+            Serial.println(targetPage);
+            break;
+          }
+        }
+      }
+      
+      if (found) {
+        g_reader.pageIndex = targetPage;
+        Serial.print("[BLE] Attempt succeeded: fontSize updated to ");
+        Serial.println(g_settings.fontSize);
+      } else {
+        Serial.print("[BLE] Attempt failed, reverting to fontSize ");
+        Serial.println(g_savedFontSize);
+        applyFontSize(g_savedFontSize);
+        prefs.putInt("cfg_font", g_savedFontSize);
+        // Invalidate page caches again to recompute offsets with original font size
+        invalidateAllPageCaches();
+        g_reader.pageIndex = g_savedPageIndex;
+        sendBLEStatus("settings_reverted");
+      }
+      
+      renderCurrentPage();
+      // Save progress after font change to persist the new position
+      saveProgress(false);
+    }
+    
+    g_savedWordSegment = "";
+    g_searchWordAfterSettings = false;
   }
 
   // Handle deferred GET_ALL_BOOKMARKS (outside BLE callback context)
