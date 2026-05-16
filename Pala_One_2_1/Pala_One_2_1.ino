@@ -18,8 +18,6 @@ DisplayType display;
 
 #include "pala_one_sleep_black_icon_v4.h"
 
-#include <WiFi.h>
-#include <WebServer.h>
 #include <Preferences.h>
 
 #include <LittleFS.h>
@@ -31,7 +29,6 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 #include <esp_timer.h>
 #include <esp_rtc_time.h>
-#include <esp_wifi.h>
 #include <esp_bt.h>
 #include <esp_sleep.h>
 #include <esp_heap_caps.h>
@@ -109,7 +106,6 @@ const uint8_t* BOLD_FONT = u8g2_font_helvB08_te;
 enum Mode {
   MODE_LIBRARY,
   MODE_READER,
-  MODE_UPLOAD,
   MODE_ABOUT,
   MODE_LIST,
   MODE_BM_BOOK_SELECT,
@@ -129,7 +125,6 @@ enum LibraryEntryType {
   LIB_ENTRY_BOOKMARKS,
   LIB_ENTRY_LIST,
   LIB_ENTRY_ABOUT,
-  LIB_ENTRY_UPLOAD,
   LIB_ENTRY_APPS,
 };
 
@@ -321,7 +316,6 @@ struct OffsetCacheEntry {
 //  Globals
 // ============================================================================
 Mode mode = MODE_LIBRARY;
-WebServer server(80);
 Preferences prefs;
 
 RuntimeSettings g_settings;
@@ -352,6 +346,22 @@ static BLECharacteristic* g_bleCharData = nullptr;
 static BLECharacteristic* g_bleCharStatus = nullptr;
 static bool g_bleConnected = false;
 
+// Deferred library reload flag
+static bool g_reloadLibrary = false;
+
+// Deferred mode switch flag
+static bool g_switchToLibrary = false;
+
+// Deferred redraw flag for settings refresh
+static bool g_redrawCurrentMode = false;
+static bool g_fetchAllBookmarks = false;
+
+// Deferred upload initialization flags
+static bool g_initUpload = false;
+static bool g_uploadIsApp = false;
+static String g_uploadPath = "";
+static uint32_t g_uploadSize = 0;
+
 // BLE file transfer state
 enum BLETransferState {
   BLE_TRANSFER_IDLE,
@@ -365,9 +375,6 @@ static uint32_t g_bleTransferOffset = 0;
 static uint32_t g_bleTransferTotalSize = 0;
 static uint32_t g_bleTransferBytesSent = 0;
 static const uint32_t BLE_CHUNK_SIZE = 512; // Safe chunk size for BLE
-
-static char AP_SSID[24] = "PALA-";
-static const char* AP_PASS = "palaread";
 
 static const uint8_t BTN_Q = 64;
 static const uint32_t BTN_QUEUE_RECOVER_THRESHOLD = 10;
@@ -479,6 +486,7 @@ static void invalidateMetrics() {
 class PalaBLEServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     g_bleConnected = true;
+    lastUserActionMs = millis(); // Reset sleep timer on connect
     sendBLEStatus("connected");
   }
   void onDisconnect(BLEServer* pServer) {
@@ -491,6 +499,9 @@ class PalaBLEServerCallbacks : public BLEServerCallbacks {
 
 class BLECommandCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) {
+    // Reset sleep timer on any BLE activity
+    lastUserActionMs = millis();
+
     std::string cmd = std::string(pCharacteristic->getValue().c_str());
     if (cmd.length() > 0) {
       handleBLECommand(cmd);
@@ -500,56 +511,150 @@ class BLECommandCallbacks : public BLECharacteristicCallbacks {
 
 class BLEDataCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) {
+    Serial.print("[BLE Data] Write callback, transfer state: ");
+    Serial.println(g_bleTransferState);
+
     if (g_bleTransferState == BLE_TRANSFER_UPLOADING && g_bleTransferFile) {
-      std::string data = std::string(pCharacteristic->getValue().c_str());
+      // Reset sleep timer to prevent sleep during upload
+      lastUserActionMs = millis();
+
+      String arduinoData = pCharacteristic->getValue();
+      std::string data = std::string(arduinoData.c_str(), arduinoData.length());
+      Serial.print("[BLE Data] Received chunk size: ");
+      Serial.println(data.length());
+
       if (data.length() > 0) {
-        g_bleTransferFile.write((const uint8_t*)data.c_str(), data.length());
+        g_bleTransferFile.write((const uint8_t*)data.data(), data.length());
         g_bleTransferOffset += data.length();
+
+        Serial.print("[BLE Upload] Received chunk: ");
+        Serial.print(g_bleTransferOffset);
+        Serial.print("/");
+        Serial.print(g_bleTransferTotalSize);
+        Serial.println(" bytes");
 
         // Send ACK with offset
         String ack = "ACK:" + String(g_bleTransferOffset);
+        Serial.print("[BLE Upload] Sending ACK: ");
+        Serial.println(ack);
         sendBLEStatus(ack.c_str());
+
+        // Yield to watchdog
+        yield();
 
         // Check if transfer complete
         if (g_bleTransferOffset >= g_bleTransferTotalSize) {
+          Serial.println("[BLE Upload] Transfer complete");
           g_bleTransferFile.close();
           g_bleTransferState = BLE_TRANSFER_IDLE;
 
-          // Apply normalization like HTTP upload
-          String tmpPath = g_bleTransferPath + ".tmp";
-          String finalPath = g_bleTransferPath;
+          if (g_uploadIsApp) {
+            // App upload - validate and finalize binary file
+            Serial.println("[BLE Upload] Validating app binary...");
+            String tmpPath = g_bleTransferPath + ".tmp";
+            String finalPath = g_bleTransferPath;
 
-          // Read, normalize, and rewrite file
-          File tmpFile = FS.open(tmpPath, "r");
-          if (tmpFile) {
-            String normalized;
-            normalized.reserve(g_bleTransferTotalSize + 8);
-            while (tmpFile.available()) {
-              String chunk = tmpFile.readStringUntil('\n');
-              chunk += '\n';
-              String cleaned = normalizeTypography(chunk);
-              cleaned = compactText(cleaned);
-              normalized += cleaned;
+            // Validate magic number and size
+            bool valid = false;
+            File vf = FS.open(tmpPath, "r");
+            if (vf) {
+              if (vf.size() >= sizeof(PalaAppHeader)) {
+                PalaAppHeader hdr;
+                if (vf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr)) {
+                  if (hdr.magic == PALA_APP_MAGIC) {
+                    valid = true;
+                    Serial.println("[BLE Upload] App magic number valid");
+                  } else {
+                    Serial.println("[BLE Upload] Invalid app magic number");
+                  }
+                }
+              }
+              vf.close();
             }
-            tmpFile.close();
 
-            // Write normalized content to final file
-            File finalFile = FS.open(finalPath, "w");
-            if (finalFile) {
-              finalFile.print(normalized);
-              finalFile.close();
-              FS.remove(tmpPath);
-              sendBLEStatus("upload_complete");
-
-              // Reload library after upload
-              loadBooks();
+            if (valid) {
+              if (FS.exists(finalPath)) FS.remove(finalPath);
+              if (FS.rename(tmpPath, finalPath)) {
+                Serial.println("[BLE Upload] App upload complete");
+                sendBLEStatus("upload_complete");
+                scanApps(); // Reload device's internal app list
+                if (mode == MODE_APPS) drawAppsMenu(); // Refresh display if in apps mode
+                g_uploadIsApp = false;
+              } else {
+                Serial.println("[BLE Upload] Failed to finalize app upload");
+                if (FS.exists(tmpPath)) FS.remove(tmpPath);
+                sendBLEStatus("upload_error:rename_failed");
+                g_uploadIsApp = false;
+              }
             } else {
-              FS.remove(tmpPath);
-              sendBLEStatus("upload_error:cannot_finalize");
+              Serial.println("[BLE Upload] App validation failed");
+              if (FS.exists(tmpPath)) FS.remove(tmpPath);
+              sendBLEStatus("upload_error:invalid_app");
+              g_uploadIsApp = false;
             }
           } else {
-            FS.remove(tmpPath);
-            sendBLEStatus("upload_error:cannot_read_tmp");
+            // Book upload - apply normalization like HTTP upload
+            Serial.println("[BLE Upload] Normalizing file...");
+            String tmpPath = g_bleTransferPath + ".tmp";
+            String finalPath = g_bleTransferPath;
+
+            // Read, normalize, and rewrite file
+            Serial.print("[BLE Upload] Normalizing file: ");
+            Serial.println(tmpPath.c_str());
+            File tmpFile = FS.open(tmpPath, "r");
+            File finalFile = FS.open(finalPath, "w");
+            if (tmpFile && finalFile) {
+              String pendingUtf8Tail = "";
+              int chunkCount = 0;
+              while (tmpFile.available()) {
+                uint8_t buf[512];
+                int bytesRead = tmpFile.read(buf, 512);
+                if (bytesRead > 0) {
+                  String chunk = pendingUtf8Tail + String((const char*)buf, bytesRead);
+                  int len = (int)chunk.length();
+                  if (len > 4) {
+                    pendingUtf8Tail = chunk.substring(len - 4);
+                    chunk = chunk.substring(0, len - 4);
+                  } else {
+                    pendingUtf8Tail = chunk;
+                    chunk = "";
+                  }
+                  if (chunk.length() > 0) {
+                    String cleaned = normalizeTypography(chunk);
+                    cleaned = compactText(cleaned);
+                    finalFile.print(cleaned);
+                  }
+                }
+                // Yield to watchdog every few chunks
+                if (++chunkCount % 10 == 0) {
+                  yield();
+                }
+              }
+              if (pendingUtf8Tail.length() > 0) {
+                String cleaned = normalizeTypography(pendingUtf8Tail);
+                cleaned = compactText(cleaned);
+                finalFile.print(cleaned);
+              }
+              tmpFile.close();
+              finalFile.close();
+              Serial.print("[BLE Upload] Removing temp file: ");
+              Serial.println(tmpPath.c_str());
+              if (FS.remove(tmpPath)) {
+                Serial.println("[BLE Upload] Temp file removed successfully");
+              } else {
+                Serial.println("[BLE Upload] Failed to remove temp file");
+              }
+              Serial.println("[BLE Upload] Upload complete");
+              sendBLEStatus("upload_complete");
+              // Defer library reload to avoid crash in BLE callback
+              g_reloadLibrary = true;
+            } else {
+              Serial.println("[BLE Upload] Failed to open files for normalization");
+              if (tmpFile) tmpFile.close();
+              if (finalFile) finalFile.close();
+              FS.remove(tmpPath);
+              sendBLEStatus("upload_error:file_open");
+            }
           }
         }
       }
@@ -591,41 +696,94 @@ static void handleBLECommand(std::string cmd) {
     }
     sendBLEStatus("list_sent");
   }
+  else if (command == "LIST_APPS") {
+    // Return JSON list of apps
+    String json = "[";
+    bool first = true;
+    if (FS.exists("/apps")) {
+      File appsDir = FS.open("/apps");
+      if (appsDir) {
+        File f = appsDir.openNextFile();
+        while (f) {
+          String name = String(f.name());
+          if (name.endsWith(".bin")) {
+            if (!first) json += ",";
+            first = false;
+            json += "{\"name\":\"" + htmlEscape(name) + "\",";
+            json += "\"path\":\"/apps/" + htmlEscape(name) + "\",";
+            json += "\"size\":" + String((int)f.size()) + "}";
+          }
+          f.close();
+          f = appsDir.openNextFile();
+        }
+        appsDir.close();
+      }
+    }
+    json += "]";
+    if (g_bleCharData && g_bleConnected) {
+      g_bleCharData->setValue(json.c_str());
+      g_bleCharData->notify();
+    }
+    sendBLEStatus("apps_list_sent");
+  }
   else if (command.startsWith("UPLOAD:")) {
     String params = command.substring(7);
+    Serial.print("[BLE] UPLOAD command: ");
+    Serial.println(params);
     // Parse: UPLOAD:/books/filename.txt:12345 (path:size)
     int colonIdx = params.indexOf(':', 1); // Skip the first colon after UPLOAD:
     if (colonIdx > 0) {
       String path = params.substring(0, colonIdx);
       uint32_t size = params.substring(colonIdx + 1).toInt();
+      Serial.print("[BLE] Path: ");
+      Serial.println(path);
+      Serial.print("[BLE] Size: ");
+      Serial.println(size);
 
       if (size > 0 && size < 10 * 1024 * 1024) { // Max 10MB
-        // Check free space
-        size_t freeBytes = fsFreeBytesSafe();
-        if (freeBytes < size + 8192) {
-          sendBLEStatus("upload_error:no_space");
-          return;
-        }
-
-        // Open file for writing
-        String tmpPath = path + ".tmp";
-        if (FS.exists(tmpPath)) FS.remove(tmpPath);
-        g_bleTransferFile = FS.open(tmpPath, "w");
-
-        if (g_bleTransferFile) {
-          g_bleTransferPath = path;
-          g_bleTransferOffset = 0;
-          g_bleTransferTotalSize = size;
-          g_bleTransferBytesSent = 0;
-          g_bleTransferState = BLE_TRANSFER_UPLOADING;
-          sendBLEStatus("upload_ready");
-        } else {
-          sendBLEStatus("upload_error:cannot_open");
-        }
+        // Defer file open to main loop to avoid BLE stack overflow
+        g_uploadPath = path;
+        g_uploadSize = size;
+        g_uploadIsApp = false; // Ensure this is a book upload
+        g_initUpload = true;
+        Serial.println("[BLE] Deferred upload initialization to main loop");
       } else {
+        Serial.println("[BLE] Invalid size");
         sendBLEStatus("upload_error:invalid_size");
       }
     } else {
+      Serial.println("[BLE] Invalid params");
+      sendBLEStatus("upload_error:invalid_params");
+    }
+  }
+  else if (command.startsWith("UPLOAD_APP:")) {
+    String params = command.substring(11);
+    Serial.print("[BLE] UPLOAD_APP command: ");
+    Serial.println(params);
+    // Parse: UPLOAD_APP:/apps/appname.bin:12345 (path:size)
+    int colonIdx = params.indexOf(':', 1); // Skip the first colon after UPLOAD_APP:
+    if (colonIdx > 0) {
+      String path = params.substring(0, colonIdx);
+      uint32_t size = params.substring(colonIdx + 1).toInt();
+      Serial.print("[BLE] Path: ");
+      Serial.println(path);
+      Serial.print("[BLE] Size: ");
+      Serial.println(size);
+
+      const size_t MAX_APP_BINARY = 48 * 1024; // 48KB max
+      if (size > 0 && size <= MAX_APP_BINARY) {
+        // Defer file open to main loop to avoid BLE stack overflow
+        g_uploadPath = path;
+        g_uploadSize = size;
+        g_uploadIsApp = true;
+        g_initUpload = true;
+        Serial.println("[BLE] Deferred app upload initialization to main loop");
+      } else {
+        Serial.println("[BLE] Invalid app size");
+        sendBLEStatus("upload_error:invalid_size");
+      }
+    } else {
+      Serial.println("[BLE] Invalid params");
       sendBLEStatus("upload_error:invalid_params");
     }
   }
@@ -758,6 +916,13 @@ static void handleBLECommand(std::string cmd) {
       invalidateAllPageCaches();
     }
     sendBLEStatus("settings_updated");
+
+    // Defer redraw to main loop to handle all modes
+    g_redrawCurrentMode = true;
+  }
+  else if (command.startsWith("GET_ALL_BOOKMARKS")) {
+    // Defer heavy processing to main loop to avoid BLE stack overflow
+    g_fetchAllBookmarks = true;
   }
   else if (command.startsWith("GET_BOOKMARKS:")) {
     String path = command.substring(14);
@@ -765,17 +930,116 @@ static void handleBLECommand(std::string cmd) {
     uint16_t pages[MAX_BOOKMARKS];
     uint32_t offsets[MAX_BOOKMARKS];
     uint8_t count = loadBookmarksForKey(key, pages, offsets);
+
+    // Open file to read bookmark labels
+    File f;
+    bool fileOpen = false;
+    if (FS.exists(path)) {
+      f = FS.open(path, "r");
+      fileOpen = f;
+    }
+
     String json = "{\"book\":\"" + path + "\",\"bookmarks\":[";
     for (uint8_t i = 0; i < count; i++) {
       if (i > 0) json += ",";
-      json += "{\"page\":" + String(pages[i]) + ",\"offset\":" + String(offsets[i]) + "}";
+      json += "{\"page\":" + String(pages[i]) + ",\"offset\":" + String(offsets[i]);
+
+      // Add label if file is open
+      if (fileOpen) {
+        uint32_t resolvedOffset = resolveBookmarkOffset(path, pages[i], offsets[i]);
+        String label = readBookmarkLabelAtOffset(f, resolvedOffset, pages[i]);
+        // Escape quotes and backslashes for JSON
+        label.replace("\\", "\\\\");
+        label.replace("\"", "\\\"");
+        Serial.print("[BLE] Bookmark label: ");
+        Serial.println(label);
+        json += ",\"label\":\"" + label + "\"";
+      } else {
+        json += ",\"label\":\"Page " + String(pages[i] + 1) + "\"";
+      }
+      json += "}";
     }
     json += "]}";
+    Serial.print("[BLE] Bookmark JSON: ");
+    Serial.println(json);
+
+    if (fileOpen) f.close();
+
     if (g_bleCharData && g_bleConnected) {
       g_bleCharData->setValue(json.c_str());
       g_bleCharData->notify();
     }
     sendBLEStatus("bookmarks_sent");
+  }
+  else if (command.startsWith("VIEW_BOOKMARK:")) {
+    String params = command.substring(14);
+    // Parse: VIEW_BOOKMARK:/books/file.txt:123 (path:page)
+    int colonIdx = params.indexOf(':', 1);
+    if (colonIdx > 0) {
+      String path = params.substring(0, colonIdx);
+      int page = params.substring(colonIdx + 1).toInt();
+
+      // Load bookmarks to get offset
+      String key = prefKeyForBook(path);
+      uint16_t pages[MAX_BOOKMARKS];
+      uint32_t offsets[MAX_BOOKMARKS];
+      uint8_t count = loadBookmarksForKey(key, pages, offsets);
+
+      // Find the bookmark with matching page
+      uint32_t offset = 0xFFFFFFFF;
+      for (uint8_t i = 0; i < count; i++) {
+        if ((int)pages[i] == page) {
+          offset = offsets[i];
+          break;
+        }
+      }
+
+      if (offset == 0xFFFFFFFF) {
+        sendBLEStatus("bookmark_not_found");
+      } else {
+        // Open file and read page
+        File f = FS.open(path, "r");
+        if (f) {
+          uint32_t resolvedOffset = resolveBookmarkOffset(path, (uint16_t)page, offset);
+          String txt;
+          txt.reserve(900);
+          readPageFromFile(f, resolvedOffset, false, &txt);
+          f.close();
+          txt.trim();
+          if (txt.length() == 0) txt = "(empty)";
+
+          // Send page text as JSON
+          String json = "{\"path\":\"" + path + "\",\"page\":" + String(page) + ",\"text\":\"";
+          // Escape quotes, backslashes, and newlines for JSON
+          txt.replace("\\", "\\\\");
+          txt.replace("\"", "\\\"");
+          txt.replace("\n", "\\n");
+          txt.replace("\r", "\\r");
+          txt.replace("\t", "\\t");
+          json += txt + "\"}";
+          Serial.print("[BLE] Bookmark view JSON: ");
+          Serial.println(json);
+
+          // Send JSON in chunks to handle BLE MTU limitations
+          int jsonLen = json.length();
+          int chunkSize = 20; // BLE MTU for notifications is typically 20-23 bytes
+          for (int offset = 0; offset < jsonLen; offset += chunkSize) {
+            int endIdx = min(offset + chunkSize, jsonLen);
+            String chunk = json.substring(offset, endIdx);
+            if (g_bleCharData && g_bleConnected) {
+              g_bleCharData->setValue(chunk.c_str());
+              g_bleCharData->notify();
+            }
+            delay(20); // Small delay between chunks
+          }
+          sendBLEStatus("bookmark_view_sent");
+        } else {
+          sendBLEStatus("file_open_failed");
+        }
+      }
+    } else {
+      sendBLEStatus("invalid_params");
+    }
   }
   else if (command.startsWith("ADD_BOOKMARK:")) {
     String bookmarkJson = command.substring(13);
@@ -894,6 +1158,48 @@ static void handleBLECommand(std::string cmd) {
       sendBLEStatus("no_active_transfer");
     }
   }
+  else if (command.startsWith("DELETE:")) {
+    String path = command.substring(7);
+    Serial.print("[BLE] DELETE command for path: ");
+    Serial.println(path);
+    if (FS.exists(path)) {
+      Serial.println("[BLE] File exists, attempting to remove");
+
+      // Close current file and switch to library mode if it's the one being deleted
+      if (g_reader.currentBookPath == path && g_reader.file) {
+        g_reader.file.close();
+        g_reader.currentBookPath = "";
+        g_reader.file = File();
+        g_reader.pageIndex = 0;
+        g_reader.knownPages = 0;
+        Serial.println("[BLE] Closed file that was open for reading");
+        // Defer mode switch to main loop to avoid FreeRTOS assert
+        g_switchToLibrary = true;
+        Serial.println("[BLE] Deferred switch to library mode");
+      }
+
+      if (FS.remove(path)) {
+        sendBLEStatus("delete_success");
+        // For books, defer library reload. For apps, reload app list
+        if (path.startsWith("/books/")) {
+          g_reloadLibrary = true;
+          Serial.println("[BLE] File removed successfully, deferred library reload");
+        } else if (path.startsWith("/apps/")) {
+          scanApps();
+          if (mode == MODE_APPS) drawAppsMenu(); // Refresh display if in apps mode
+          Serial.println("[BLE] File removed successfully, apps reloaded");
+        } else {
+          Serial.println("[BLE] File removed successfully");
+        }
+      } else {
+        Serial.println("[BLE] Failed to remove file");
+        sendBLEStatus("delete_error:cannot_remove");
+      }
+    } else {
+      Serial.println("[BLE] File not found");
+      sendBLEStatus("delete_error:not_found");
+    }
+  }
   else {
     sendBLEStatus("unknown_command");
   }
@@ -922,7 +1228,9 @@ static void setupBLE() {
 
   g_bleCharData = pService->createCharacteristic(
     PALA_BLE_CHAR_DATA_UUID,
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY
   );
   g_bleCharData->setCallbacks(new BLEDataCallbacks());
   g_bleCharData->addDescriptor(new BLE2902());
@@ -1774,7 +2082,6 @@ static String libraryEntryLabel(int idx) {
     case LIB_ENTRY_BOOKMARKS: return "Bookmarks";
     case LIB_ENTRY_LIST:      return "List";
     case LIB_ENTRY_ABOUT:     return "Device";
-    case LIB_ENTRY_UPLOAD:    return "Upload";
     case LIB_ENTRY_APPS:      return "Apps";
   }
   return "";
@@ -1841,12 +2148,6 @@ static void buildLibraryEntries() {
   }
   if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
     g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_APPS;
-    g_library.entryRefs[g_library.entryCount] = -1;
-    g_library.entryDepths[g_library.entryCount] = 0;
-    g_library.entryCount++;
-  }
-  if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
-    g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_UPLOAD;
     g_library.entryRefs[g_library.entryCount] = -1;
     g_library.entryDepths[g_library.entryCount] = 0;
     g_library.entryCount++;
@@ -2875,8 +3176,7 @@ static void drawLibrary() {
     bool isSystem = (g_library.entryTypes[idx] == LIB_ENTRY_BOOKMARKS ||
                      g_library.entryTypes[idx] == LIB_ENTRY_LIST ||
                      g_library.entryTypes[idx] == LIB_ENTRY_ABOUT ||
-                     g_library.entryTypes[idx] == LIB_ENTRY_APPS ||
-                     g_library.entryTypes[idx] == LIB_ENTRY_UPLOAD);
+                     g_library.entryTypes[idx] == LIB_ENTRY_APPS );
     bool boldText = (idx == g_library.selectedItem);
     drawMenuBulletRow(y, label, idx == g_library.selectedItem, boldText, g_library.entryDepths[idx], isSystem);
     y += lineH;
@@ -3544,1265 +3844,6 @@ static String readPageTextForWeb(const String& path, int page) {
 }
 
 // ============================================================================
-//  Web handlers
-// ============================================================================
-static void handleRoot() {
-  loadBooks();
-
-  size_t totalBytes = FS.totalBytes();
-  size_t usedBytes = FS.usedBytes();
-  size_t freeBytes = (totalBytes >= usedBytes) ? (totalBytes - usedBytes) : 0;
-
-  String subtitle = "Firmware ";
-  subtitle += FW_VERSION;
-  subtitle += " &middot; ";
-  subtitle += String(g_library.bookCount);
-  subtitle += " books &middot; Free: ";
-  subtitle += humanBytes(freeBytes);
-  subtitle += " / ";
-  subtitle += humanBytes(totalBytes);
-
-  String out = webPageStart(
-    "Pala One",
-    subtitle,
-    "<a href='/files'>Files</a><a href='/bookmarks'>Bookmarks</a><a href='/list'>List</a><a href='/settings'>Settings</a><a href='/reset'>Factory reset</a>"
-  );
-
-  out += storageCardHtml();
-
-  if (fsTotalBytesSafe() == 0 || fsFreeBytesSafe() < 8192) {
-    out += "<div class='banner-warn'>&#9888; Storage is not available or almost full. If uploads fail, delete books or use Factory reset from this web UI.</div>";
-  }
-
-  out +=
-    "<div class='card'><h2>Upload book</h2>"
-    "<p class='muted'>Send UTF-8 plain text files to <b>/books</b> on the device, then sort them into folders from the Files page.</p>"
-    "<form method='POST' action='/upload' enctype='multipart/form-data' accept-charset='UTF-8' style='margin-top:14px'>"
-    "<input type='file' name='file' accept='.txt,text/plain' required>"
-    "<div class='actions'><button type='submit'>Upload</button><a class='btn secondary' href='/files'>Manage files</a></div>"
-    "</form></div>";
-
-  out +=
-    "<div class='card'><h2>Upload app (.bin)</h2>"
-    "<p class='muted'>Upload a Pala app binary compiled with the Pala SDK. "
-    "Files are stored in <b>/apps/</b> and appear in the Apps menu on the device.</p>"
-    "<form method='POST' action='/upload-app' enctype='multipart/form-data' style='margin-top:14px'>"
-    "<input type='file' name='file' accept='.bin,application/octet-stream' required>"
-    "<div class='actions'><button type='submit'>Upload app</button></div>"
-    "</form></div>";
-
-  out += "<div class='card'><h2>Notes</h2><p class='muted'>Uploaded books are normalized and compacted before saving, so a source TXT can be larger than the final stored file. The reader is optimized for UTF-8 plain text and Latin-based languages.</p></div>";
-
-  out += webPageEnd();
-  server.send(200, "text/html; charset=utf-8", out);
-}
-
-static void handleFiles() {
-  loadBooks();
-  String out = webPageStart(
-    "Files",
-    "Manage books, folders and library structure for Pala One.",
-    "<a href='/'>Home</a><a href='/bookmarks'>Bookmarks</a><a href='/settings'>Settings</a>",
-    true
-  );
-
-  out +=
-    "<div class='card'><h2>Create folder</h2>"
-    "<form method='POST' action='/mkdir' class='stack' accept-charset='UTF-8' style='margin-top:12px'>"
-    "<input type='text' name='folder' placeholder='books or classics/english' maxlength='64'>"
-    "<div class='actions'><button type='submit'>Create folder</button><span class='muted'>Folders live inside /books.</span></div>"
-    "</form></div>";
-
-  out += "<div class='card'><h2>Folders</h2>";
-  if (g_library.folderCount == 0) {
-    out += "<p class='muted'>No folders yet. Books currently live in the root of /books.</p>";
-  } else {
-    out += "<ul class='list'>";
-    for (int i = 0; i < g_library.folderCount; i++) {
-      out += "<li><div class='row'><div><span class='pill'>";
-      out += htmlEscape(prettyRelativeLabel(String(g_library.folders[i])));
-      out += "<span></span></div><div><form method='POST' action='/rmdir' style='display:inline'>";
-      out += "<input type='hidden' name='folder' value='";
-      out += htmlEscape(g_library.folders[i]);
-      out += "'><button type='submit' class='btn secondary' onclick=\"return confirm('Delete folder? Only empty folders can be deleted.')\">Delete</button></form></div></div></li>";
-    }
-    out += "</ul>";
-  }
-  out += "</div>";
-
-  out += "<div class='card'><h2>Library files</h2>";
-  if (g_library.bookCount >= MAX_BOOKS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Library full (80 books max). Delete books to make room.</p>";
-  if (g_library.folderCount >= MAX_FOLDERS) out += "<p style='color:#b91c1c;font-weight:600'>&#9888; Folder limit reached (32 max).</p>";
-
-  if (g_library.bookCount == 0) {
-    out += "<p class='muted'>No books uploaded yet.</p>";
-  } else {
-    out += "<ul class='list'>";
-    for (int i = 0; i < g_library.bookCount; i++) {
-      String bookPath = String(g_library.books[i].path);
-      String folderLabel = g_library.books[i].folder[0] ? prettyRelativeLabel(g_library.books[i].folder) : String("Root");
-      int savedPage = savedPageForBookPath(bookPath) + 1;
-      if (savedPage < 1) savedPage = 1;
-
-      out += "<li><div class='row'><div><h3>";
-      out += htmlEscape(String(g_library.books[i].name));
-      out += "</h3><div class='meta'>";
-      out += String((int)g_library.books[i].size);
-      out += " bytes &middot; folder: ";
-      out += htmlEscape(folderLabel);
-      out += " &middot; current page: ";
-      out += String(savedPage);
-      out += "</div>";
-
-      out += "<form method='POST' action='/jumppage' class='stack small' accept-charset='UTF-8' style='margin-top:10px'>";
-      out += "<input type='hidden' name='id' value='" + String(i) + "'>";
-      out += "<div class='row' style='align-items:end;gap:10px'><div style='flex:1'><input type='text' name='page' value='" + String(savedPage) + "' inputmode='numeric' placeholder='Page'></div><div><button type='submit'>Jump</button></div></div>";
-      out += "<div class='muted'>Set the page that should open next on the device.<br><span class='muted'>The first open may take a moment.</span></div></form>";
-
-      out += "<form method='POST' action='/move' class='stack small' accept-charset='UTF-8' style='margin-top:10px'>";
-      out += "<input type='hidden' name='id' value='" + String(i) + "'>";
-      out += "<input type='text' name='folder' value='" + htmlEscape(String(g_library.books[i].folder)) + "' placeholder='leave blank for root' maxlength='64'>";
-      out += "<div class='actions'><button type='submit'>Move</button><span class='muted'>Use the exact folder path.</span></div></form></div>";
-      out += "<div><form method='POST' action='/del' style='display:inline'><input type='hidden' name='id' value='" + String(i) + "'>";
-      out += "<button type='submit' class='btn secondary' onclick=\"return confirm('Delete file?')\">Delete</button></form></div></div></li>";
-    }
-    out += "</ul>";
-  }
-
-  out += "</div>";
-
-  out += "<div class='card'><h2>Apps</h2>";
-  {
-    File appsDir = FS.open("/apps");
-    bool anyApp = false;
-    if (appsDir) {
-      File f = appsDir.openNextFile();
-      while (f) {
-        String name = String(f.name());
-        if (name.endsWith(".bin")) {
-          if (!anyApp) { out += "<ul class='list'>"; anyApp = true; }
-          out += "<li><div class='row'><div><h3>";
-          out += htmlEscape(name);
-          out += "</h3><div class='meta'>";
-          out += String((int)f.size());
-          out += " bytes</div></div><div><form method='POST' action='/del-app' style='display:inline'>";
-          out += "<input type='hidden' name='name' value='";
-          out += htmlEscape(name);
-          out += "'><button type='submit' class='btn secondary' onclick=\"return confirm('Delete app?')\">Delete</button></form></div></div></li>";
-        }
-        f.close();
-        f = appsDir.openNextFile();
-      }
-      appsDir.close();
-    }
-    if (!anyApp) out += "<p class='muted'>No apps installed.</p>";
-    else out += "</ul>";
-  }
-  out += "</div>";
-
-  out += webPageEnd();
-  server.send(200, "text/html; charset=utf-8", out);
-}
-
-static void handleDeleteApp() {
-  if (!server.hasArg("name")) {
-    server.send(400, "text/plain; charset=utf-8", "missing name");
-    return;
-  }
-  String name = server.arg("name");
-  // reject anything with path separators
-  if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || !name.endsWith(".bin")) {
-    server.send(400, "text/plain; charset=utf-8", "invalid name");
-    return;
-  }
-  String path = "/apps/" + name;
-  FS.remove(path);
-  server.sendHeader("Location", "/files");
-  server.send(303);
-}
-
-static void handleDelete() {
-  if (!server.hasArg("id")) {
-    server.send(400, "text/plain; charset=utf-8", "missing id");
-    return;
-  }
-
-  loadBooks();
-  int id = server.arg("id").toInt();
-  if (id < 0 || id >= g_library.bookCount) {
-    server.send(400, "text/plain; charset=utf-8", "bad id");
-    return;
-  }
-
-  String path = String(g_library.books[id].path);
-  if (g_reader.currentBookPath == path) {
-    clearCurrentBookState();
-    resetPreviewState();
-    syncWakeState(false);
-  }
-
-  if (FS.exists(path)) FS.remove(path);
-  deleteBookMetadata(path);
-  resetOffsetCache();
-
-  server.sendHeader("Location", "/files");
-  server.send(302, "text/plain", "");
-}
-
-static void handleCreateFolder() {
-  ensureBooksDir();
-  if (!server.hasArg("folder")) {
-    server.send(400, "text/plain; charset=utf-8", "missing folder");
-    return;
-  }
-
-  loadBooks();
-  String folder = sanitizeFolderInput(server.arg("folder"));
-  if (folder.length() == 0) {
-    server.send(400, "text/plain; charset=utf-8", "bad folder");
-    return;
-  }
-  if (g_library.folderCount >= MAX_FOLDERS) {
-    server.send(409, "text/plain; charset=utf-8", "folder limit reached");
-    return;
-  }
-
-  String fullPath = "/books/" + folder;
-  if (!ensureDirRecursive(fullPath)) {
-    server.send(500, "text/plain; charset=utf-8", "mkdir failed");
-    return;
-  }
-
-  server.sendHeader("Location", "/files");
-  server.send(302, "text/plain", "");
-}
-
-static void handleDeleteFolder() {
-  if (!server.hasArg("folder")) {
-    server.send(400, "text/plain; charset=utf-8", "missing folder");
-    return;
-  }
-
-  String folder = sanitizeFolderInput(server.arg("folder"));
-  if (folder.length() == 0) {
-    server.send(400, "text/plain; charset=utf-8", "bad folder");
-    return;
-  }
-
-  String fullPath = "/books/" + folder;
-  if (!FS.exists(fullPath)) {
-    server.send(404, "text/plain; charset=utf-8", "folder not found");
-    return;
-  }
-  if (!isDirEmpty(fullPath)) {
-    server.send(409, "text/plain; charset=utf-8", "folder not empty");
-    return;
-  }
-  if (!FS.rmdir(fullPath)) {
-    server.send(500, "text/plain; charset=utf-8", "delete failed");
-    return;
-  }
-
-  server.sendHeader("Location", "/files");
-  server.send(302, "text/plain", "");
-}
-
-static void handleMoveBook() {
-  loadBooks();
-  if (!server.hasArg("id")) {
-    server.send(400, "text/plain; charset=utf-8", "missing id");
-    return;
-  }
-
-  int id = server.arg("id").toInt();
-  if (id < 0 || id >= g_library.bookCount) {
-    server.send(400, "text/plain; charset=utf-8", "bad id");
-    return;
-  }
-
-  String oldPath = String(g_library.books[id].path);
-  String folder = sanitizeFolderInput(server.arg("folder"));
-  String destDir = (folder.length() == 0) ? String("/books") : String("/books/") + folder;
-
-  if (!ensureDirRecursive(destDir)) {
-    server.send(500, "text/plain; charset=utf-8", "folder create failed");
-    return;
-  }
-
-  String newPath = destDir + "/" + lastPathComponent(oldPath);
-  if (newPath == oldPath) {
-    server.sendHeader("Location", "/files");
-    server.send(302, "text/plain", "");
-    return;
-  }
-  if (FS.exists(newPath)) {
-    server.send(409, "text/plain; charset=utf-8", "destination exists");
-    return;
-  }
-
-  bool wasCurrent = (g_reader.currentBookPath == oldPath);
-  if (wasCurrent && g_reader.file) g_reader.file.close();
-
-  if (!FS.rename(oldPath, newPath)) {
-    server.send(500, "text/plain; charset=utf-8", "move failed");
-    return;
-  }
-
-  migrateBookMetadata(oldPath, newPath);
-  resetOffsetCache();
-  if (wasCurrent) g_reader.file = FS.open(newPath, "r");
-
-  server.sendHeader("Location", "/files");
-  server.send(302, "text/plain", "");
-}
-
-static void handleJumpPageWeb() {
-  loadBooks();
-  if (!server.hasArg("id") || !server.hasArg("page")) {
-    server.send(400, "text/plain; charset=utf-8", "missing id/page");
-    return;
-  }
-
-  int id = server.arg("id").toInt();
-  if (id < 0 || id >= g_library.bookCount) {
-    server.send(400, "text/plain; charset=utf-8", "bad id");
-    return;
-  }
-
-  int page = server.arg("page").toInt();
-  if (page < 1) page = 1;
-  int zeroBasedPage = page - 1;
-
-  String path = String(g_library.books[id].path);
-  String key = prefKeyForBook(path);
-  prefs.putInt((key + "_p").c_str(), zeroBasedPage);
-
-  if (g_reader.currentBookPath == path) {
-    g_reader.pageIndex = zeroBasedPage;
-    if (g_reader.pageIndex < 0) g_reader.pageIndex = 0;
-    resetSaveThrottle();
-    saveProgressThrottled(true);
-    if (g_reader.file) {
-      savePageOffsetCacheForBook(g_reader.currentBookPath, g_reader.file.size());
-    }
-  }
-
-  server.sendHeader("Location", "/files");
-  server.send(302, "text/plain", "");
-}
-
-static void handleUploadDone() {
-  if (!g_upload.bookOk) {
-    server.send(400, "text/plain; charset=utf-8", g_upload.bookError.length() ? g_upload.bookError : "Upload failed");
-    return;
-  }
-
-  loadBooks();
-  size_t totalBytes = FS.totalBytes();
-  size_t usedBytes = FS.usedBytes();
-  size_t freeBytes = (totalBytes >= usedBytes) ? (totalBytes - usedBytes) : 0;
-
-  String finalPath = "/books/" + g_upload.bookFinalName;
-  size_t storedSize = 0;
-  File stored = FS.open(finalPath, "r");
-  if (stored) {
-    storedSize = stored.size();
-    stored.close();
-  }
-
-  String inner;
-  inner.reserve(1200);
-  inner += "<div class='card'><h2>Upload complete</h2><p class='muted'>Your book is now stored on the device and available in the library.</p>";
-  inner += "<div class='stats'>";
-  inner += "<div class='stat'><span class='muted'>Book</span><b>" + htmlEscape(g_upload.bookFinalName) + "</b></div>";
-  inner += "<div class='stat'><span class='muted'>Stored size</span><b>" + humanBytes(storedSize) + "</b></div>";
-  inner += "<div class='stat'><span class='muted'>Books now</span><b>" + String(g_library.bookCount) + "</b></div>";
-  inner += "<div class='stat'><span class='muted'>Free space</span><b>" + humanBytes(freeBytes) + "</b></div>";
-  inner += "</div><div class='actions'><a class='btn' href='/'>Upload another</a><a class='btn secondary' href='/files'>Open files</a></div></div>";
-  inner += storageCardHtml();
-
-  String page = successPage(
-    "Upload complete",
-    "Book saved successfully.",
-    "&#10003; Upload finished. No more blank status page.",
-    inner
-  );
-  server.send(200, "text/html; charset=utf-8", page);
-}
-
-static void handleBookmarksWeb() {
-  loadBooks();
-  String out = webPageStart(
-    "Bookmarks",
-    "Saved reading positions for Pala One, grouped by book.",
-    "<a href='/'>Home</a><a href='/files'>Files</a><a href='/settings'>Settings</a>",
-    true
-  );
-
-  if (g_library.bookCount == 0) out += "<div class='card'><p class='muted'>No books available yet.</p></div>";
-
-  for (int i = 0; i < g_library.bookCount; i++) {
-    String bookPath = String(g_library.books[i].path);
-    String key = prefKeyForBook(bookPath);
-    uint16_t pages[MAX_BOOKMARKS];
-    uint32_t offsets[MAX_BOOKMARKS];
-    uint8_t count = loadBookmarksForKey(key, pages, offsets);
-
-    out += "<div class='card'><h2>";
-    out += htmlEscape(String(g_library.books[i].name));
-    out += "</h2>";
-
-    if (count == 0) {
-      out += "<p class='muted'>No bookmarks</p></div>";
-      continue;
-    }
-
-    File f = FS.open(bookPath, "r");
-    if (!f) {
-      out += "<p class='muted'>Open failed</p></div>";
-      continue;
-    }
-
-    out += "<ul class='list'>";
-
-    for (int j = 0; j < count; j++) {
-      int targetPage = (int)pages[j];
-      if (targetPage < 0) targetPage = 0;
-
-      uint32_t pageOff = resolveBookmarkOffset(bookPath, (uint16_t)targetPage, offsets[j]);
-      String sn = readBookmarkLabelAtOffset(f, pageOff, targetPage);
-      out += "<li><div class='row'><div><div class='pill'>Bookmark ";
-      out += String(j + 1);
-      out += "</div><p class='meta' style='margin-top:8px'>";
-      out += htmlEscape(sn);
-      out += "</p></div><div><a class='link' href='/viewbm?book=" + String(i) + "&idx=" + String(j) + "'>View</a> | ";
-      out += "<form method='POST' action='/delbm' style='display:inline'>";
-      out += "<input type='hidden' name='book' value='" + String(i) + "'>";
-      out += "<input type='hidden' name='idx' value='" + String(j) + "'>";
-      out += "<button type='submit' class='btn secondary' style='padding:4px 8px;font-size:13px' onclick=\"return confirm('Delete bookmark?')\">Delete</button>";
-      out += "</form></div></div></li>";
-    }
-
-    out += "</ul><div class='actions'><a class='btn secondary' href='/exportbm?book=" + String(i) + "'>Download all bookmarks</a></div></div>";
-    f.close();
-  }
-
-  out += webPageEnd();
-  server.send(200, "text/html; charset=utf-8", out);
-}
-
-static void handleDeleteBookmarkWeb() {
-  if (!server.hasArg("book") || !server.hasArg("idx")) {
-    server.send(400, "text/plain; charset=utf-8", "missing book/idx");
-    return;
-  }
-
-  loadBooks();
-  int b = server.arg("book").toInt();
-  int idx = server.arg("idx").toInt();
-  if (b < 0 || b >= g_library.bookCount) {
-    server.send(400, "text/plain; charset=utf-8", "bad book");
-    return;
-  }
-
-  String key = prefKeyForBook(String(g_library.books[b].path));
-  uint16_t pages[MAX_BOOKMARKS];
-  uint32_t offsets[MAX_BOOKMARKS];
-  uint8_t count = loadBookmarksForKey(key, pages, offsets);
-  if (idx < 0 || idx >= count) {
-    server.send(400, "text/plain; charset=utf-8", "bad idx");
-    return;
-  }
-
-  for (int i = idx + 1; i < count; i++) {
-    pages[i - 1] = pages[i];
-    offsets[i - 1] = offsets[i];
-  }
-  count--;
-  saveBookmarksForKey(key, pages, offsets, count);
-
-  server.sendHeader("Location", "/bookmarks");
-  server.send(302, "text/plain", "");
-}
-
-static void handleViewBookmarkWeb() {
-  if (!server.hasArg("book") || !server.hasArg("idx")) {
-    server.send(400, "text/plain; charset=utf-8", "missing book/idx");
-    return;
-  }
-
-  loadBooks();
-  int b = server.arg("book").toInt();
-  int idx = server.arg("idx").toInt();
-  if (b < 0 || b >= g_library.bookCount) {
-    server.send(400, "text/plain; charset=utf-8", "bad book");
-    return;
-  }
-
-  String key = prefKeyForBook(String(g_library.books[b].path));
-  uint16_t pages[MAX_BOOKMARKS];
-  uint32_t offsets[MAX_BOOKMARKS];
-  uint8_t count = loadBookmarksForKey(key, pages, offsets);
-  if (idx < 0 || idx >= count) {
-    server.send(400, "text/plain; charset=utf-8", "bad idx");
-    return;
-  }
-
-  int page = (int)pages[idx];
-  String bookPath = String(g_library.books[b].path);
-  File vf = FS.open(bookPath, "r");
-  String txt;
-  if (!vf) {
-    txt = "Open failed.";
-  } else {
-    uint32_t off = resolveBookmarkOffset(bookPath, (uint16_t)page, offsets[idx]);
-    txt.reserve(900);
-    (void)readPageFromFile(vf, off, false, &txt);
-    vf.close();
-    txt.trim();
-    if (txt.length() == 0) txt = "(empty)";
-  }
-  String out = webPageStart(
-    "Bookmark View",
-    "Preview the saved page text for this bookmark.",
-    "<a href='/bookmarks'>&#8592; Back</a><a href='/files'>Files</a><a href='/'>Home</a>",
-    true
-  );
-
-  out += "<div class='card'><h2>";
-  out += htmlEscape(String(g_library.books[b].name));
-  out += "</h2><p class='muted'>Bookmark ";
-  out += String(idx + 1);
-  out += "</p><pre class='pre'>";
-  out += htmlEscape(txt);
-  out += "</pre><div class='actions'><a class='btn secondary' href='/exportbm?book=" + String(b) + "'>Download all bookmarks</a></div></div>";
-  out += webPageEnd();
-  server.send(200, "text/html; charset=utf-8", out);
-}
-
-static void handleExportBookmarksWeb() {
-  if (!server.hasArg("book")) {
-    server.send(400, "text/plain; charset=utf-8", "missing book");
-    return;
-  }
-
-  loadBooks();
-  int b = server.arg("book").toInt();
-  if (b < 0 || b >= g_library.bookCount) {
-    server.send(400, "text/plain; charset=utf-8", "bad book");
-    return;
-  }
-
-  String bookPath = String(g_library.books[b].path);
-  String key = prefKeyForBook(bookPath);
-  uint16_t pages[MAX_BOOKMARKS];
-  uint32_t offsets[MAX_BOOKMARKS];
-  uint8_t count = loadBookmarksForKey(key, pages, offsets);
-
-  if (count == 0) {
-    server.send(404, "text/plain; charset=utf-8", "No bookmarks for this book");
-    return;
-  }
-
-  File f = FS.open(bookPath, "r");
-  if (!f) {
-    server.send(500, "text/plain; charset=utf-8", "Open failed");
-    return;
-  }
-
-  String exportName = stripTxtExt(lastPathComponent(bookPath));
-  exportName.replace(' ', '_');
-  exportName += "_bookmarks.txt";
-
-  String out;
-  out.reserve(8192);
-
-  out += "Book: ";
-  out += stripTxtExt(lastPathComponent(bookPath));
-  out += "\n";
-
-  out += "Bookmarks: ";
-  out += String(count);
-  out += "\n\n";
-
-  for (int i = 0; i < count; i++) {
-    int targetPage = (int)pages[i];
-    if (targetPage < 0) targetPage = 0;
-
-    uint32_t pageOff = resolveBookmarkOffset(bookPath, (uint16_t)targetPage, offsets[i]);
-    String label = readBookmarkLabelAtOffset(f, pageOff, targetPage);
-    String txt = readPageTextForWeb(bookPath, targetPage);
-
-    out += "==================================================\n";
-    out += "Bookmark ";
-    out += String(i + 1);
-    out += "\n";
-    out += label;
-    out += "\n";
-    out += "--------------------------------------------------\n";
-    out += txt;
-    out += "\n\n";
-  }
-
-  f.close();
-
-  server.sendHeader(
-    "Content-Disposition",
-    String("attachment; filename=\"") + exportName + "\""
-  );
-  server.send(200, "text/plain; charset=utf-8", out);
-}
-
-static void doFactoryReset() {
-  safeCloseCurrentBook();
-  clearCurrentBookState();
-  resetUiEphemeralState();
-  resetNavigationState();
-  syncWakeState(false);
-
-  prefs.clear();
-  FS.end();
-  delay(100);
-  FS.format();
-  delay(200);
-  if (!FS.begin(true)) return;
-  ensureBooksDir();
-  resetOffsetCache();
-  loadBooks();
-}
-
-static void handleResetConfirm() {
-  String out = webPageStart(
-    "Factory Reset",
-    "Erase all books, bookmarks, progress, and custom assets.",
-    "<a href='/'>Back</a>"
-  );
-  out +=
-    "<div class='card'><h2>Confirm reset</h2>"
-    "<p><strong>This will delete ALL books, bookmarks and reading progress.</strong></p>"
-    "<p class='muted'>The device filesystem will be formatted and settings will return to defaults.</p>"
-    "<form method='POST' action='/reset' style='margin-top:14px'><button class='danger' type='submit'>Yes, reset</button></form>"
-    "</div>";
-  out += webPageEnd();
-  server.send(200, "text/html; charset=utf-8", out);
-}
-
-static void handleResetDo() {
-  doFactoryReset();
-
-  String inner;
-  inner.reserve(600);
-  inner += "<div class='card'><h2>Factory reset complete</h2><p class='muted'>All books, bookmarks, progress and custom assets were removed. The device is now back to a clean state.</p><div class='actions'><a class='btn' href='/'>Go to home</a><a class='btn secondary' href='/files'>Open files</a></div></div>";
-  inner += storageCardHtml();
-
-  String page = successPage(
-    "Reset complete",
-    "Pala One was reset successfully.",
-    "&#10003; Factory reset complete.",
-    inner
-  );
-  server.send(200, "text/html; charset=utf-8", page);
-}
-
-static void handleListWeb() {
-  loadListItems();
-  String out = webPageStart(
-    "List",
-    "Create a simple shopping or to-do list for Pala One.",
-    "<a href='/'>Home</a><a href='/files'>Files</a><a href='/bookmarks'>Bookmarks</a><a href='/settings'>Settings</a>",
-    true
-  );
-
-  out += "<div class='card'><h2>Edit list</h2><p class='muted'>Items appear on the device only when at least one line contains text. Hold the button on the device to mark an item as done.</p>";
-  out += "<form method='POST' action='/list' class='stack' accept-charset='UTF-8' style='margin-top:12px'>";
-  for (int i = 0; i < MAX_LIST_ITEMS; i++) {
-    String value = (i < g_list.count) ? htmlEscape(String(g_list.items[i].text)) : String("");
-    String checked = (i < g_list.count && g_list.items[i].done) ? " checked" : "";
-    out += "<div class='row' style='align-items:center;gap:10px'><div style='width:26px;text-align:center'><input type='checkbox' name='done" + String(i) + "' value='1'" + checked + "></div><div style='flex:1'><input type='text' name='item" + String(i) + "' value='" + value + "' maxlength='64' placeholder='List item'></div></div>";
-  }
-  out += "<div class='actions'><button type='submit'>Save list</button><button type='submit' formaction='/list-clear-done'>Delete checked items</button><span class='muted'>Blank rows are ignored. Checked rows can be removed directly.</span></div></form></div>";
-  out += webPageEnd();
-  server.send(200, "text/html; charset=utf-8", out);
-}
-
-static void handleListSaveWeb() {
-  ListState newList;
-  newList.count = 0;
-  newList.selectedIndex = 0;
-
-  for (int i = 0; i < MAX_LIST_ITEMS; i++) {
-    String name = String("item") + String(i);
-    String doneName = String("done") + String(i);
-    String text = server.arg(name);
-    sanitizeListText(text);
-    if (text.length() == 0) continue;
-    strncpy(newList.items[newList.count].text, text.c_str(), MAX_LIST_TEXT);
-    newList.items[newList.count].text[MAX_LIST_TEXT] = '\0';
-    newList.items[newList.count].done = server.hasArg(doneName) ? 1 : 0;
-    newList.count++;
-    if (newList.count >= MAX_LIST_ITEMS) break;
-  }
-
-  g_list = newList;
-  saveListItems();
-  if (!listHasVisibleItems() && mode == MODE_LIST) {
-    mode = MODE_LIBRARY;
-  }
-  server.sendHeader("Location", "/list");
-  server.send(302, "text/plain", "");
-}
-
-static void handleListClearDoneWeb() {
-  ListState newList;
-  newList.count = 0;
-  newList.selectedIndex = 0;
-
-  for (int i = 0; i < MAX_LIST_ITEMS; i++) {
-    String name = String("item") + String(i);
-    String doneName = String("done") + String(i);
-    String text = server.arg(name);
-    sanitizeListText(text);
-
-    if (text.length() == 0) continue;
-    if (server.hasArg(doneName)) continue;  // checked in web UI => delete it
-
-    strncpy(newList.items[newList.count].text, text.c_str(), MAX_LIST_TEXT);
-    newList.items[newList.count].text[MAX_LIST_TEXT] = '\0';
-    newList.items[newList.count].done = 0;
-    newList.count++;
-    if (newList.count >= MAX_LIST_ITEMS) break;
-  }
-
-  g_list = newList;
-  saveListItems();
-  if (!listHasVisibleItems() && mode == MODE_LIST) mode = MODE_LIBRARY;
-
-  server.sendHeader("Location", "/list");
-  server.send(302, "text/plain", "");
-}
-
-static void handleSettings() {
-  String sel8 = (g_settings.fontSize == 8) ? " selected" : "";
-  String sel10 = (g_settings.fontSize == 10) ? " selected" : "";
-  String sel12 = (g_settings.fontSize == 12) ? " selected" : "";
-  String sel14 = (g_settings.fontSize == 14) ? " selected" : "";
-
-  String ss30 = (g_settings.sleepSecs == 30) ? " selected" : "";
-  String ss60 = (g_settings.sleepSecs == 60) ? " selected" : "";
-  String ss120 = (g_settings.sleepSecs == 120) ? " selected" : "";
-  String ss300 = (g_settings.sleepSecs == 300) ? " selected" : "";
-  String ss600 = (g_settings.sleepSecs == 600) ? " selected" : "";
-  String ss1800 = (g_settings.sleepSecs == 1800) ? " selected" : "";
-
-  String lg0 = (g_settings.lineGap == 0) ? " selected" : "";
-  String lg1 = (g_settings.lineGap == 1) ? " selected" : "";
-  String lg2 = (g_settings.lineGap == 2) ? " selected" : "";
-  String lg3 = (g_settings.lineGap == 3) ? " selected" : "";
-
-  bool hasSleepImg = FS.exists("/sleep.bin");
-
-  String out;
-  out.reserve(4800);
-  out =
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Settings</title>"
-    "<style>"
-    "body{margin:0;background:#f3efe7;color:#1f2328;font:15px/1.45 system-ui,sans-serif}"
-    ".wrap{max-width:760px;margin:0 auto;padding:18px}"
-    ".top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}"
-    ".top a,.link{color:#3c5a7a;text-decoration:none}"
-    ".muted{color:#667085;font-size:13px}"
-    ".card{background:#fff;border:1px solid #ddd4c7;border-radius:14px;padding:14px 15px;margin:0 0 14px;box-shadow:0 1px 0 rgba(0,0,0,.03)}"
-    ".grid{display:grid;gap:12px}"
-    "label{display:block;font-weight:600;margin:0 0 6px}"
-    "select,input[type=file]{width:100%;box-sizing:border-box;border:1px solid #c9c2b8;border-radius:10px;background:#fff;padding:10px;font:inherit}"
-    ".hint{margin:6px 0 0;color:#667085;font-size:12px}"
-    ".actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}"
-    "button{border:0;border-radius:10px;background:#1f2328;color:#fff;padding:10px 14px;font:600 14px system-ui,sans-serif}"
-    ".status{padding:10px 12px;border-radius:10px;font-size:14px;margin:10px 0 0}"
-    ".ok{background:#e7f6ec;color:#216e39}"
-    ".idle{background:#f6f2ea;color:#6b6358}"
-    "h1,h2{margin:0 0 6px}"
-    "p{margin:0 0 10px}"
-    "@media(min-width:620px){.grid.cols-2{grid-template-columns:1fr 1fr}}"
-    "</style></head><body><div class='wrap'>"
-    "<div class='top'><div><h1>Pala One Settings</h1><div class='muted'>Firmware " FW_VERSION " configuration page stored directly on the device.</div></div><a href='/'>&#8592; Home</a></div>"
-    "<div class='card'><h2>Reading</h2><form method='POST' action='/settings' accept-charset='UTF-8'><div class='grid cols-2'><div><label for='font'>Font size</label><select id='font' name='font'>"
-    "<option value='8'"; out += sel8; out += ">8px &mdash; tiny</option>";
-  out += "<option value='10'"; out += sel10; out += ">10px &mdash; small</option>";
-  out += "<option value='12'"; out += sel12; out += ">12px &mdash; medium</option>";
-  out += "<option value='14'"; out += sel14; out += ">14px &mdash; large</option>";
-  out +=
-    "</select><div class='hint'>Controls how many lines fit on each page.</div></div>"
-    "<div><label for='sleep'>Sleep after</label><select id='sleep' name='sleep'>"
-    "<option value='30'"; out += ss30; out += ">30 seconds</option>";
-  out += "<option value='60'"; out += ss60; out += ">1 minute</option>";
-  out += "<option value='120'"; out += ss120; out += ">2 minutes</option>";
-  out += "<option value='300'"; out += ss300; out += ">5 minutes</option>";
-  out += "<option value='600'"; out += ss600; out += ">10 minutes</option>";
-  out += "<option value='1800'"; out += ss1800; out += ">30 minutes</option>";
-  out += "</select><div class='hint'>Auto-sleep keeps battery draw low while idle.</div></div>";
-  out += "<div><label for='lgap'>Line spacing</label><select id='lgap' name='lgap'>";
-  out += "<option value='0'"; out += lg0; out += ">0 px &mdash; compact</option>";
-  out += "<option value='1'"; out += lg1; out += ">1 px &mdash; normal</option>";
-  out += "<option value='2'"; out += lg2; out += ">2 px &mdash; relaxed</option>";
-  out += "<option value='3'"; out += lg3; out += ">3 px &mdash; loose</option>";
-  out +=
-    "</select><div class='hint'>A small change here can make text much easier to scan.</div></div>"
-    "</div>"
-    "<div class='actions' style='margin-top:24px;'><button type='submit'>Save settings</button><span class='muted'>No extra files, scripts, or fonts.</span></div></form></div>"
-    "<div class='card'><h2>Screensaver</h2>"
-    "<p>Upload raw XBM bytes: <b>3904 bytes</b>, 250&times;122 px, 1-bit, LSB-first, 32 bytes per row.</p>"
-    "<p class='muted'>Tip: use <a class='link' href='https://javl.github.io/image2cpp/' target='_blank'>image2cpp</a> with <b>Plain bytes</b>. Invert colors if needed.</p>";
-
-  if (hasSleepImg) {
-    out += "<div class='status ok'>&#10003; Custom screensaver active. <a class='link' href='/del-sleep' onclick=\"return confirm('Delete custom screensaver?')\">Delete</a></div>";
-  } else {
-    out += "<div class='status idle'>Using built-in screensaver.</div>";
-  }
-
-  out +=
-    "<form method='POST' action='/upload-sleep' enctype='multipart/form-data' style='margin-top:14px'>"
-    "<div class='grid'><div><label for='file'>Sleep image file</label><input id='file' type='file' name='file' accept='.bin'></div></div>"
-    "<div class='actions'><button type='submit'>Upload image</button></div>"
-    "</form></div></div></body></html>";
-
-  server.send(200, "text/html; charset=utf-8", out);
-}
-
-static void handleSettingsPost() {
-  bool layoutChanged = false;
-
-  if (server.hasArg("font")) {
-    int fs = server.arg("font").toInt();
-    if (fs != 8 && fs != 10 && fs != 12 && fs != 14) fs = 10;
-    if (fs != g_settings.fontSize) {
-      applyFontSize(fs);
-      prefs.putInt("cfg_font", fs);
-      layoutChanged = true;
-    }
-  }
-
-  if (server.hasArg("sleep")) {
-    int ss = server.arg("sleep").toInt();
-    if (ss < 10) ss = 10;
-    if (ss > 3600) ss = 3600;
-    if ((uint32_t)ss != g_settings.sleepSecs) {
-      g_settings.sleepSecs = (uint32_t)ss;
-      prefs.putInt("cfg_sleep", ss);
-    }
-  }
-
-  if (server.hasArg("lgap")) {
-    int lg = server.arg("lgap").toInt();
-    if (lg < 0) lg = 0;
-    if (lg > 4) lg = 4;
-    if (lg != g_settings.lineGap) {
-      g_settings.lineGap = lg;
-      prefs.putInt("cfg_lgap", lg);
-      invalidateMetrics();
-      layoutChanged = true;
-    }
-  }
-
-  if (layoutChanged) {
-    // invalidateAllPageCaches() already resets pageIndex to 0 for the open book.
-    // Call it BEFORE renderCurrentPage() so the page is redrawn from byte 0
-    // with the new font metrics -- not from the now-invalid old page number.
-    invalidateAllPageCaches();
-    if (mode == MODE_READER || mode == MODE_BM_PREVIEW) {
-      g_bookmarkUi.previewActive = false; // exit preview on layout change
-      mode = MODE_READER;
-      renderCurrentPage();
-    }
-  }
-
-  server.sendHeader("Location", "/settings");
-  server.send(302, "text/plain", "");
-}
-
-
-static void handleDeleteSleepImg() {
-  if (FS.exists("/sleep.bin")) FS.remove("/sleep.bin");
-  server.sendHeader("Location", "/settings");
-  server.send(302, "text/plain", "");
-}
-
-static void handleUploadSleepDone() {
-  if (!g_upload.sleepOk) {
-    server.send(400, "text/plain; charset=utf-8", g_upload.sleepError.length() ? g_upload.sleepError : "Sleep image upload failed");
-    return;
-  }
-
-  String inner;
-  inner.reserve(500);
-  inner += "<div class='card'><h2>Screensaver updated</h2><p class='muted'>Your custom sleep image was saved successfully and will be shown the next time the device goes to sleep.</p><div class='actions'><a class='btn' href='/settings'>Back to settings</a><a class='btn secondary' href='/'>Home</a></div></div>";
-
-  String page = successPage(
-    "Upload complete",
-    "Screensaver saved successfully.",
-    "&#10003; Custom sleep image uploaded.",
-    inner
-  );
-  server.send(200, "text/html; charset=utf-8", page);
-}
-
-// ============================================================================
-//  Upload stream handlers
-// ============================================================================
-static void handleUploadBookStream() {
-  HTTPUpload& up = server.upload();
-
-  if (up.status == UPLOAD_FILE_START) {
-    g_upload.bookOk = false;
-    g_upload.bookError = "";
-    g_upload.bookFinalName = "";
-    g_upload.bookPendingUtf8Tail = "";
-    g_upload.bookTmpPath = "";
-
-    loadBooks();
-    if (g_library.bookCount >= MAX_BOOKS) {
-      g_upload.bookError = "Library full";
-      return;
-    }
-
-    size_t freeBytes = fsFreeBytesSafe();
-    if (freeBytes < 8192) {
-      g_upload.bookError = "Not enough free space";
-      return;
-    }
-
-    String clean = sanitizeUploadedFilename(up.filename);
-    g_upload.bookFinalName = clean;
-    g_upload.bookTmpPath = "/books/" + clean + ".tmp";
-
-    if (FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
-    g_upload.bookTmpFile = FS.open(g_upload.bookTmpPath, "w");
-    if (!g_upload.bookTmpFile) {
-      g_upload.bookError = "Cannot create temp upload file";
-      g_upload.bookTmpPath = "";
-    }
-  }
-  else if (up.status == UPLOAD_FILE_WRITE) {
-    if (g_upload.bookError.length() > 0) return;
-    if (g_upload.bookTmpFile && up.currentSize > 0) {
-      String chunk = g_upload.bookPendingUtf8Tail + String((const char*)up.buf, up.currentSize);
-      int len = (int)chunk.length();
-      if (len > 4) {
-        g_upload.bookPendingUtf8Tail = chunk.substring(len - 4);
-        chunk = chunk.substring(0, len - 4);
-      } else {
-        g_upload.bookPendingUtf8Tail = chunk;
-        chunk = "";
-      }
-      if (chunk.length() > 0) {
-        String cleaned = normalizeTypography(chunk);
-        cleaned = compactText(cleaned);
-        g_upload.bookTmpFile.print(cleaned);
-      }
-    }
-  }
-  else if (up.status == UPLOAD_FILE_END) {
-    if (g_upload.bookError.length() > 0 && !g_upload.bookTmpFile) return;
-    if (g_upload.bookTmpFile) {
-      if (g_upload.bookPendingUtf8Tail.length() > 0) {
-        String cleaned = normalizeTypography(g_upload.bookPendingUtf8Tail);
-        cleaned = compactText(cleaned);
-        g_upload.bookTmpFile.print(cleaned);
-        g_upload.bookPendingUtf8Tail = "";
-      }
-      g_upload.bookTmpFile.close();
-
-      if (g_upload.bookTmpPath.length() > 0 && up.totalSize > 0) {
-        String finalPath = g_upload.bookTmpPath.substring(0, g_upload.bookTmpPath.length() - 4);
-        if (FS.exists(finalPath)) FS.remove(finalPath);
-        if (FS.rename(g_upload.bookTmpPath, finalPath)) {
-          g_upload.bookOk = true;
-        } else {
-          if (FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
-          g_upload.bookError = "Failed to finalize upload";
-        }
-      } else {
-        if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
-        g_upload.bookError = "Empty upload";
-      }
-      g_upload.bookTmpPath = "";
-    } else {
-      if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
-      if (g_upload.bookError.length() == 0) g_upload.bookError = "Upload failed";
-      g_upload.bookTmpPath = "";
-    }
-  }
-  else if (up.status == UPLOAD_FILE_ABORTED) {
-    if (g_upload.bookTmpFile) g_upload.bookTmpFile.close();
-    if (g_upload.bookTmpPath.length() > 0 && FS.exists(g_upload.bookTmpPath)) FS.remove(g_upload.bookTmpPath);
-    g_upload.bookPendingUtf8Tail = "";
-    g_upload.bookTmpPath = "";
-    g_upload.bookOk = false;
-    g_upload.bookError = "Upload aborted";
-  }
-}
-
-static void handleUploadSleepStream() {
-  HTTPUpload& upS = server.upload();
-
-  if (upS.status == UPLOAD_FILE_START) {
-    g_upload.sleepOk = false;
-    g_upload.sleepError = "";
-    g_upload.sleepTmpPath = "/sleep.bin.tmp";
-    if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-    g_upload.sleepTmpFile = FS.open(g_upload.sleepTmpPath, "w");
-    if (!g_upload.sleepTmpFile) g_upload.sleepError = "Cannot create temp sleep file";
-  }
-  else if (upS.status == UPLOAD_FILE_WRITE) {
-    if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.write(upS.buf, upS.currentSize);
-  }
-  else if (upS.status == UPLOAD_FILE_END) {
-    if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.close();
-    File f = FS.open(g_upload.sleepTmpPath, "r");
-    size_t sz = f ? f.size() : 0;
-    if (f) f.close();
-
-    if (sz != 3904) {
-      if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-      g_upload.sleepError = "Sleep image must be exactly 3904 bytes";
-      g_upload.sleepOk = false;
-    } else {
-      if (FS.exists("/sleep.bin")) FS.remove("/sleep.bin");
-      if (FS.rename(g_upload.sleepTmpPath, "/sleep.bin")) g_upload.sleepOk = true;
-      else {
-        if (FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-        g_upload.sleepError = "Failed to save sleep image";
-      }
-    }
-    g_upload.sleepTmpPath = "";
-  }
-  else if (upS.status == UPLOAD_FILE_ABORTED) {
-    if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.close();
-    if (g_upload.sleepTmpPath.length() > 0 && FS.exists(g_upload.sleepTmpPath)) FS.remove(g_upload.sleepTmpPath);
-    g_upload.sleepError = "Sleep image upload aborted";
-    g_upload.sleepOk = false;
-    g_upload.sleepTmpPath = "";
-  }
-}
-
-static void handleUploadAppDone() {
-  if (!g_upload.appOk) {
-    server.send(400, "text/plain; charset=utf-8",
-                g_upload.appError.length() ? g_upload.appError : "App upload failed");
-    return;
-  }
-  String inner;
-  inner.reserve(400);
-  inner += "<div class='card'><h2>App uploaded</h2>"
-           "<p class='muted'>App is now available in the Apps menu on the device.</p>"
-           "<div class='actions'><a class='btn' href='/'>Upload another</a></div></div>";
-  String page = successPage("App uploaded", "App saved.", "&#10003; App ready.", inner);
-  server.send(200, "text/html; charset=utf-8", page);
-}
-
-static void handleUploadAppStream() {
-  HTTPUpload& up = server.upload();
-
-  if (up.status == UPLOAD_FILE_START) {
-    g_upload.appOk = false;
-    g_upload.appError = "";
-    g_upload.appFinalName = "";
-    g_upload.appTmpPath = "";
-
-    size_t freeBytes = fsFreeBytesSafe();
-    if (freeBytes < 4096) {
-      g_upload.appError = "Not enough free space";
-      return;
-    }
-
-    // sanitizeUploadedFilename appends .txt; strip all extensions then re-add .bin
-    String fname = sanitizeUploadedFilename(up.filename);
-    int dot = fname.lastIndexOf('.');
-    while (dot > 0) { fname = fname.substring(0, dot); dot = fname.lastIndexOf('.'); }
-    if (fname.length() == 0) fname = "app";
-    fname += ".bin";
-
-    g_upload.appFinalName = fname;
-    g_upload.appTmpPath = "/apps/" + fname + ".tmp";
-    if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
-    g_upload.appTmpFile = FS.open(g_upload.appTmpPath, "w");
-    if (!g_upload.appTmpFile) {
-      g_upload.appError = "Cannot create temp app file";
-      g_upload.appTmpPath = "";
-    }
-  }
-  else if (up.status == UPLOAD_FILE_WRITE) {
-    if (g_upload.appError.length() > 0) return;
-    if (g_upload.appTmpFile) g_upload.appTmpFile.write(up.buf, up.currentSize);
-  }
-  else if (up.status == UPLOAD_FILE_END) {
-    if (g_upload.appTmpFile) g_upload.appTmpFile.close();
-    if (g_upload.appError.length() > 0 || g_upload.appTmpPath.length() == 0) return;
-
-    if (up.totalSize < sizeof(PalaAppHeader) + 4) {
-      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
-      g_upload.appError = "App binary too small";
-      g_upload.appTmpPath = "";
-      return;
-    }
-
-    // Validate magic before committing
-    bool validMagic = false;
-    File vf = FS.open(g_upload.appTmpPath, "r");
-    if (vf) {
-      PalaAppHeader hdr;
-      if (vf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr))
-        validMagic = (hdr.magic == PALA_APP_MAGIC);
-      vf.close();
-    }
-    if (!validMagic) {
-      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
-      g_upload.appError = "Invalid app binary (bad magic)";
-      g_upload.appTmpPath = "";
-      return;
-    }
-
-    String finalPath = "/apps/" + g_upload.appFinalName;
-    if (FS.exists(finalPath)) FS.remove(finalPath);
-    if (FS.rename(g_upload.appTmpPath, finalPath)) {
-      g_upload.appOk = true;
-    } else {
-      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
-      g_upload.appError = "Failed to finalize app upload";
-    }
-    g_upload.appTmpPath = "";
-  }
-  else if (up.status == UPLOAD_FILE_ABORTED) {
-    if (g_upload.appTmpFile) g_upload.appTmpFile.close();
-    if (g_upload.appTmpPath.length() > 0 && FS.exists(g_upload.appTmpPath))
-      FS.remove(g_upload.appTmpPath);
-    g_upload.appTmpPath = "";
-    g_upload.appOk = false;
-    g_upload.appError = "Upload aborted";
-  }
-}
-
-// ============================================================================
-//  Upload mode / server lifecycle
-// ============================================================================
-static void registerWebRoutes() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/files", HTTP_GET, handleFiles);
-  server.on("/del",     HTTP_POST, handleDelete);   // POST: prevents accidental deletion via browser prefetch
-  server.on("/del-app", HTTP_POST, handleDeleteApp);
-  server.on("/mkdir", HTTP_POST, handleCreateFolder);
-  server.on("/move", HTTP_POST, handleMoveBook);
-  server.on("/jumppage", HTTP_POST, handleJumpPageWeb);
-  server.on("/list", HTTP_GET, handleListWeb);
-  server.on("/list", HTTP_POST, handleListSaveWeb);
-  server.on("/list-clear-done", HTTP_POST, handleListClearDoneWeb);
-  server.on("/rmdir", HTTP_POST, handleDeleteFolder); // POST: destructive
-
-  server.on("/reset", HTTP_GET, handleResetConfirm);
-  server.on("/reset", HTTP_POST, handleResetDo);
-
-  server.on("/bookmarks", HTTP_GET, handleBookmarksWeb);
-  server.on("/delbm",  HTTP_POST, handleDeleteBookmarkWeb); // POST: destructive
-  server.on("/viewbm", HTTP_GET, handleViewBookmarkWeb);
-  server.on("/exportbm", HTTP_GET, handleExportBookmarksWeb);
-
-  server.on("/settings", HTTP_GET, handleSettings);
-  server.on("/settings", HTTP_POST, handleSettingsPost);
-  server.on("/del-sleep", HTTP_GET, handleDeleteSleepImg);
-
-  server.on("/upload-sleep", HTTP_POST, handleUploadSleepDone, handleUploadSleepStream);
-  server.on("/upload-app",   HTTP_POST, handleUploadAppDone,   handleUploadAppStream);
-  server.on("/upload", HTTP_POST, handleUploadDone, handleUploadBookStream);
-}
-
-static void startUploadMode() {
-  mode = MODE_UPLOAD;
-  g_upload.startedMs = millis();
-
-  setCpuFrequencyMhz(240); // WiFi AP needs full speed
-
-  prepareMenuFrame();
-
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  IPAddress ip = WiFi.softAPIP();
-  String url = String("http://") + ip.toString();
-
-  int y = drawSectionHeader("Upload");
-
-  u8g2.setFont(BOLD_FONT);
-  u8g2.setCursor(MARGIN_X, y);
-  u8g2.print("Wi-Fi");
-  y += 14;
-
-  u8g2.setFont(MAIN_FONT);
-  u8g2.setCursor(MARGIN_X, y);
-  u8g2.print(AP_SSID);
-  y += 16;
-
-  u8g2.setFont(BOLD_FONT);
-  u8g2.setCursor(MARGIN_X, y);
-  u8g2.print("Password");
-  y += 14;
-
-  u8g2.setFont(MAIN_FONT);
-  u8g2.setCursor(MARGIN_X, y);
-  u8g2.print(AP_PASS);
-  y += 16;
-
-  u8g2.setFont(BOLD_FONT);
-  u8g2.setCursor(MARGIN_X, y);
-  u8g2.print("Open");
-  y += 14;
-
-  u8g2.setFont(MAIN_FONT);
-  u8g2.setCursor(MARGIN_X, y);
-  u8g2.print(url.c_str());
-  y += 18;
-
-  display.update();
-  server.begin();
-}
-
-static void stopUploadModeToLibrary() {
-  server.stop();
-
-  if (g_upload.bookTmpFile)  g_upload.bookTmpFile.close();
-  if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.close();
-  if (g_upload.appTmpFile)   g_upload.appTmpFile.close();
-
-  WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  esp_wifi_stop();
-  btStop();
-
-  g_upload.bookPendingUtf8Tail = "";
-  g_upload.bookTmpPath = "";
-  g_upload.bookOk = false;
-  g_upload.bookError = "";
-  g_upload.bookFinalName = "";
-
-  g_upload.sleepOk = false;
-  g_upload.sleepError = "";
-  g_upload.sleepTmpPath = "";
-
-  g_upload.appOk = false;
-  g_upload.appError = "";
-  g_upload.appTmpPath = "";
-  g_upload.appFinalName = "";
-
-  loadBooks();
-  mode = MODE_LIBRARY;
-  resetInputFrontend();
-  setCpuFrequencyMhz(80); // back to low-power idle
-  drawLibrary();
-}
-
-// ============================================================================
 //  Sleep handling
 // ============================================================================
 static void drawSleepScreen() {
@@ -4848,11 +3889,6 @@ static void goToSleep() {
   drawSleepScreen();
   delay(600);
 
-  WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  esp_wifi_stop();
   btStop();
 
   Platform::prepareToSleep();
@@ -4898,15 +3934,9 @@ void setup() {
   ensureBooksDir();
   if (!FS.exists("/apps")) FS.mkdir("/apps");
 
-  {
-    uint64_t chipId = ESP.getEfuseMac();
-    snprintf(AP_SSID, sizeof(AP_SSID), "PALA-%06llX", chipId & 0xFFFFFFULL);
-  }
-
   prefs.begin("ereader", false);
   loadSettings();
   loadBooks();
-  registerWebRoutes();
   markUserActivity();
 
   bool restored = false;
@@ -4942,12 +3972,6 @@ void setup() {
 // ============================================================================
 //  Mode handlers
 // ============================================================================
-static void handleModeUpload() {
-  server.handleClient();
-  bool timeout = (uint32_t)(millis() - g_upload.startedMs) > UPLOAD_AUTO_EXIT_MS;
-  if (btns.shortClick || timeout) stopUploadModeToLibrary();
-}
-
 static void handleModeAbout() {
   if (btns.shortClick || btns.doubleClick || btns.longClick || btns.quadClick) {
     mode = MODE_LIBRARY;
@@ -5174,8 +4198,6 @@ static void handleModeLibrary() {
     drawAppsMenu();
     return;
   }
-
-  startUploadMode();
 }
 
 static void handleModeList() {
@@ -5272,22 +4294,212 @@ void loop() {
 
   if (btns.anyClick()) markUserActivity();
 
-  if (ENABLE_DEEP_SLEEP && mode != MODE_UPLOAD) {
-    if ((uint32_t)(millis() - lastUserActionMs) > sleepAfterMs()) {
+  // Handle deferred library reload (outside BLE callback context)
+  if (g_reloadLibrary) {
+    Serial.println("[BLE] Performing deferred library reload");
+    loadBooks();
+    // Redraw library screen if in library mode
+    if (mode == MODE_LIBRARY) {
+      drawLibrary();
+    }
+    g_reloadLibrary = false;
+    // Notify iOS app that library is ready
+    sendBLEStatus("library_ready");
+    Serial.println("[BLE] Library ready");
+  }
+
+  // Handle deferred mode switch (outside BLE callback context)
+  if (g_switchToLibrary) {
+    Serial.println("[BLE] Performing deferred switch to library mode");
+    mode = MODE_LIBRARY;
+    g_switchToLibrary = false;
+  }
+
+  // Handle deferred redraw (outside BLE callback context)
+  if (g_redrawCurrentMode) {
+    Serial.println("[BLE] Redrawing current mode");
+    invalidateMetrics();
+    switch (mode) {
+      case MODE_LIBRARY: drawLibrary(); break;
+      case MODE_READER: renderCurrentPage(); break;
+      case MODE_LIST: drawListScreen(); break;
+      case MODE_ABOUT: drawAbout(); break;
+      case MODE_APPS: drawAppsMenu(); break;
+      default: break;
+    }
+    g_redrawCurrentMode = false;
+  }
+
+  // Handle deferred GET_ALL_BOOKMARKS (outside BLE callback context)
+  if (g_fetchAllBookmarks) {
+    Serial.println("[BLE] Fetching all bookmarks");
+    loadBooks();
+    Serial.print("[BLE] Library loaded: ");
+    Serial.print(g_library.bookCount);
+    Serial.println(" books");
+
+    String json = "[";
+    bool first = true;
+    int totalBookmarks = 0;
+
+    for (int b = 0; b < g_library.bookCount; b++) {
+      String path = String(g_library.books[b].path);
+      String key = prefKeyForBook(path);
+      uint16_t pages[MAX_BOOKMARKS];
+      uint32_t offsets[MAX_BOOKMARKS];
+      uint8_t count = loadBookmarksForKey(key, pages, offsets);
+
+      Serial.print("[BLE] Book: ");
+      Serial.print(g_library.books[b].name);
+      Serial.print(" - ");
+      Serial.print(count);
+      Serial.println(" bookmarks");
+
+      if (count == 0) continue;
+
+      // Open file to read bookmark labels
+      File f;
+      bool fileOpen = false;
+      if (FS.exists(path)) {
+        f = FS.open(path, "r");
+        fileOpen = f;
+      }
+
+      for (uint8_t i = 0; i < count; i++) {
+        if (!first) json += ",";
+        first = false;
+        totalBookmarks++;
+
+        json += "{\"book\":\"" + String(g_library.books[b].name) + "\",\"path\":\"" + path + "\",\"page\":" + String(pages[i]) + ",\"offset\":" + String(offsets[i]);
+
+        // Add label if file is open
+        if (fileOpen) {
+          uint32_t resolvedOffset = resolveBookmarkOffset(path, pages[i], offsets[i]);
+          String label = readBookmarkLabelAtOffset(f, resolvedOffset, pages[i]);
+          // Escape quotes and backslashes for JSON
+          label.replace("\\", "\\\\");
+          label.replace("\"", "\\\"");
+          json += ",\"label\":\"" + label + "\"";
+        } else {
+          json += ",\"label\":\"Page " + String(pages[i] + 1) + "\"";
+        }
+        json += "}";
+      }
+
+      if (fileOpen) f.close();
+    }
+
+    json += "]";
+
+    Serial.print("[BLE] Total bookmarks sent: ");
+    Serial.println(totalBookmarks);
+    Serial.print("[BLE] JSON length: ");
+    Serial.println(json.length());
+
+    // Send JSON in chunks to avoid BLE MTU truncation
+    const int maxChunkSize = 200; // Conservative chunk size
+    int jsonLen = json.length();
+    int offset = 0;
+    int chunkNum = 0;
+
+    while (offset < jsonLen) {
+      int chunkSize = min(maxChunkSize, jsonLen - offset);
+      String chunk = json.substring(offset, offset + chunkSize);
+
+      if (g_bleCharData && g_bleConnected) {
+        g_bleCharData->setValue(chunk.c_str());
+        g_bleCharData->notify();
+      }
+
+      offset += chunkSize;
+      chunkNum++;
+      Serial.print("[BLE] Sent chunk ");
+      Serial.print(chunkNum);
+      Serial.print(" (");
+      Serial.print(chunkSize);
+      Serial.println(" bytes)");
+      delay(50); // Increased delay between chunks
+    }
+
+    // Additional delay before sending status to ensure all chunks are delivered
+    delay(100);
+
+    sendBLEStatus("all_bookmarks_sent");
+    g_fetchAllBookmarks = false;
+  }
+
+  // Handle deferred upload initialization (outside BLE callback context)
+  if (g_initUpload) {
+    Serial.println("[BLE] Initializing upload in main loop");
+    size_t freeBytes = fsFreeBytesSafe();
+    Serial.print("[BLE] Free space: ");
+    Serial.println(freeBytes);
+    if (freeBytes < g_uploadSize + 8192) {
+      Serial.println("[BLE] Not enough space");
+      sendBLEStatus("upload_error:no_space");
+      g_initUpload = false;
+      g_uploadIsApp = false;
+    } else {
+      // Ensure apps directory exists for app uploads
+      if (g_uploadIsApp && !FS.exists("/apps")) {
+        FS.mkdir("/apps");
+        Serial.println("[BLE] Created /apps directory");
+      }
+      
+      String tmpPath = g_uploadPath + ".tmp";
+      Serial.print("[BLE] Opening temp file: ");
+      Serial.println(tmpPath);
+      if (FS.exists(tmpPath)) FS.remove(tmpPath);
+      g_bleTransferFile = FS.open(tmpPath, "w");
+
+      if (g_bleTransferFile) {
+        Serial.println("[BLE] File opened successfully");
+        g_bleTransferPath = g_uploadPath;
+        g_bleTransferOffset = 0;
+        g_bleTransferTotalSize = g_uploadSize;
+        g_bleTransferBytesSent = 0;
+        g_bleTransferState = BLE_TRANSFER_UPLOADING;
+        Serial.println("[BLE] Sending upload_ready status");
+        sendBLEStatus("upload_ready");
+      } else {
+        Serial.println("[BLE] Failed to open file");
+        sendBLEStatus("upload_error:cannot_open");
+      }
+      g_uploadPath = "";
+      g_uploadSize = 0;
+      g_initUpload = false;
+    }
+  }
+
+  // Keep device awake while BLE connected to companion
+  if (g_bleConnected) {
+    lastUserActionMs = millis();
+  }
+
+  if (ENABLE_DEEP_SLEEP) {
+    static uint32_t lastSleepLogMs = 0;
+    uint32_t elapsed = (uint32_t)(millis() - lastUserActionMs);
+    uint32_t sleepAfter = sleepAfterMs();
+    int32_t remaining = (int32_t)sleepAfter - (int32_t)elapsed;
+
+    // Log remaining sleep time every 10 seconds
+    if ((uint32_t)(millis() - lastSleepLogMs) > 10000) {
+      Serial.print("[Sleep] Time to sleep: ");
+      Serial.print(remaining / 1000);
+      Serial.println(" seconds");
+      lastSleepLogMs = millis();
+    }
+
+    if (elapsed > sleepAfter) {
       goToSleep();
       return;
     }
   }
 
-  if (btns.tripleClick && mode == MODE_UPLOAD) {
-    stopUploadModeToLibrary();
-    return;
-  }
-
   // Global triple-click = go home to library root.
   // Bookmark screens handle triple-click themselves for correct back-navigation,
   // so exclude them here.
-  if (btns.tripleClick && mode != MODE_UPLOAD
+  if (btns.tripleClick
       && mode != MODE_BM_PREVIEW
       && mode != MODE_BM_LIST
       && mode != MODE_BM_BOOK_SELECT) {
@@ -5297,7 +4509,6 @@ void loop() {
   }
 
   switch (mode) {
-    case MODE_UPLOAD:         handleModeUpload(); break;
     case MODE_ABOUT:          handleModeAbout(); break;
     case MODE_LIST:           handleModeList(); break;
     case MODE_APPS:           handleModeApps(); break;
