@@ -18,6 +18,88 @@ DisplayType display;
 
 #include "pala_one_sleep_black_icon_v4.h"
 
+// Define U8G2_FONT_SECTION as empty for Arduino compatibility
+#ifndef U8G2_FONT_SECTION
+#define U8G2_FONT_SECTION(name)
+#endif
+
+// Custom fonts
+#include "fonts/atkinson_regular_12.c"
+#include "fonts/atkinson_regular_14.c"
+#include "fonts/atkinson_regular_16.c"
+#include "fonts/atkinson_regular_18.c"
+#include "fonts/atkinson_regular_20.c"
+#include "fonts/atkinson_medium_12.c"
+#include "fonts/atkinson_medium_14.c"
+#include "fonts/atkinson_medium_16.c"
+#include "fonts/atkinson_medium_18.c"
+#include "fonts/atkinson_medium_20.c"
+#include "fonts/atkinson_semibold_12.c"
+#include "fonts/atkinson_semibold_14.c"
+#include "fonts/atkinson_semibold_16.c"
+#include "fonts/atkinson_semibold_18.c"
+#include "fonts/atkinson_semibold_20.c"
+#include "fonts/atkinson_bold_12.c"
+#include "fonts/atkinson_bold_14.c"
+#include "fonts/atkinson_bold_16.c"
+#include "fonts/atkinson_bold_18.c"
+#include "fonts/atkinson_bold_20.c"
+#include "fonts/atkinson_extrabold_12.c"
+#include "fonts/atkinson_extrabold_14.c"
+#include "fonts/atkinson_extrabold_16.c"
+#include "fonts/atkinson_extrabold_18.c"
+#include "fonts/atkinson_extrabold_20.c"
+#include "fonts/noto_sans_regular_12.c"
+#include "fonts/noto_sans_regular_14.c"
+#include "fonts/noto_sans_regular_16.c"
+#include "fonts/noto_sans_regular_18.c"
+#include "fonts/noto_sans_regular_20.c"
+#include "fonts/noto_sans_medium_12.c"
+#include "fonts/noto_sans_medium_14.c"
+#include "fonts/noto_sans_medium_16.c"
+#include "fonts/noto_sans_medium_18.c"
+#include "fonts/noto_sans_medium_20.c"
+#include "fonts/noto_sans_semibold_12.c"
+#include "fonts/noto_sans_semibold_14.c"
+#include "fonts/noto_sans_semibold_16.c"
+#include "fonts/noto_sans_semibold_18.c"
+#include "fonts/noto_sans_semibold_20.c"
+#include "fonts/noto_sans_bold_12.c"
+#include "fonts/noto_sans_bold_14.c"
+#include "fonts/noto_sans_bold_16.c"
+#include "fonts/noto_sans_bold_18.c"
+#include "fonts/noto_sans_bold_20.c"
+#include "fonts/noto_sans_extrabold_12.c"
+#include "fonts/noto_sans_extrabold_14.c"
+#include "fonts/noto_sans_extrabold_16.c"
+#include "fonts/noto_sans_extrabold_18.c"
+#include "fonts/noto_sans_extrabold_20.c"
+#include "fonts/noto_serif_regular_12.c"
+#include "fonts/noto_serif_regular_14.c"
+#include "fonts/noto_serif_regular_16.c"
+#include "fonts/noto_serif_regular_18.c"
+#include "fonts/noto_serif_regular_20.c"
+#include "fonts/noto_serif_medium_12.c"
+#include "fonts/noto_serif_medium_14.c"
+#include "fonts/noto_serif_medium_16.c"
+#include "fonts/noto_serif_medium_18.c"
+#include "fonts/noto_serif_medium_20.c"
+#include "fonts/noto_serif_semibold_12.c"
+#include "fonts/noto_serif_semibold_14.c"
+#include "fonts/noto_serif_semibold_16.c"
+#include "fonts/noto_serif_semibold_18.c"
+#include "fonts/noto_serif_semibold_20.c"
+#include "fonts/noto_serif_bold_12.c"
+#include "fonts/noto_serif_bold_14.c"
+#include "fonts/noto_serif_bold_16.c"
+#include "fonts/noto_serif_bold_18.c"
+#include "fonts/noto_serif_bold_20.c"
+#include "fonts/noto_serif_extrabold_12.c"
+#include "fonts/noto_serif_extrabold_14.c"
+#include "fonts/noto_serif_extrabold_16.c"
+#include "fonts/noto_serif_extrabold_18.c"
+#include "fonts/noto_serif_extrabold_20.c"
+
 #include <Preferences.h>
 
 #include <LittleFS.h>
@@ -144,10 +226,12 @@ struct LayoutMetrics {
 };
 
 struct RuntimeSettings {
-  int fontSize = 8;
+  int fontSize = 12;
   uint32_t sleepSecs = 120;
   int lineGap = 0;
   int readerLongPressAction = LONGPRESS_BOOKMARK;
+  int fontFamily = 0;  // 0=atkinson, 1=noto_sans, 2=noto_serif
+  int fontWeight = 0;  // 0=regular, 1=medium, 2=semibold, 3=bold, 4=extrabold
 };
 
 struct LibraryState {
@@ -848,6 +932,8 @@ static void handleBLECommand(std::string cmd) {
     // Return current settings as JSON
     String json = "{";
     json += "\"fontSize\":" + String(g_settings.fontSize) + ",";
+    json += "\"fontFamily\":" + String(g_settings.fontFamily) + ",";
+    json += "\"fontWeight\":" + String(g_settings.fontWeight) + ",";
     json += "\"sleepSecs\":" + String(g_settings.sleepSecs) + ",";
     json += "\"lineGap\":" + String(g_settings.lineGap) + ",";
     json += "\"readerLongPressAction\":" + String(g_settings.readerLongPressAction);
@@ -860,7 +946,7 @@ static void handleBLECommand(std::string cmd) {
   }
   else if (command.startsWith("SET_SETTINGS:")) {
     String settingsJson = command.substring(13);
-    // Simple JSON parsing: {"fontSize":10,"sleepSecs":120,"lineGap":0}
+    // Simple JSON parsing: {"fontSize":10,"fontFamily":0,"sleepSecs":120,"lineGap":0}
     bool layoutChanged = false;
     bool wasReading = (mode == MODE_READER) && g_reader.file;
 
@@ -871,10 +957,54 @@ static void handleBLECommand(std::string cmd) {
 
     Serial.print("[BLE] Settings before: fontSize=");
     Serial.print(g_settings.fontSize);
+    Serial.print(", fontFamily=");
+    Serial.print(g_settings.fontFamily);
     Serial.print(", sleepSecs=");
     Serial.print(g_settings.sleepSecs);
     Serial.print(", lineGap=");
     Serial.println(g_settings.lineGap);
+
+    // Parse fontFamily
+    int ffIdx = settingsJson.indexOf("\"fontFamily\":");
+    if (ffIdx >= 0) {
+      int valStart = ffIdx + 13;
+      int valEnd = settingsJson.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = settingsJson.indexOf('}', valStart);
+      if (valEnd > valStart) {
+        int ff = settingsJson.substring(valStart, valEnd).toInt();
+        if (ff >= 0 && ff <= 2) {
+          if (ff != g_settings.fontFamily) {
+            g_settings.fontFamily = ff;
+            prefs.putInt("cfg_font_family", ff);
+            applyFontSize(g_settings.fontSize); // Re-apply font size with new family
+            layoutChanged = true;
+            Serial.print("[BLE] Changed fontFamily to ");
+            Serial.println(ff);
+          }
+        }
+      }
+    }
+
+    // Parse fontWeight
+    int fwIdx = settingsJson.indexOf("\"fontWeight\":");
+    if (fwIdx >= 0) {
+      int valStart = fwIdx + 13;
+      int valEnd = settingsJson.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = settingsJson.indexOf('}', valStart);
+      if (valEnd > valStart) {
+        int fw = settingsJson.substring(valStart, valEnd).toInt();
+        if (fw >= 0 && fw <= 4) {
+          if (fw != g_settings.fontWeight) {
+            g_settings.fontWeight = fw;
+            prefs.putInt("cfg_font_weight", fw);
+            applyFontSize(g_settings.fontSize); // Re-apply font size with new weight
+            layoutChanged = true;
+            Serial.print("[BLE] Changed fontWeight to ");
+            Serial.println(fw);
+          }
+        }
+      }
+    }
 
     // Parse fontSize
     int fsIdx = settingsJson.indexOf("\"fontSize\":");
@@ -884,7 +1014,7 @@ static void handleBLECommand(std::string cmd) {
       if (valEnd < 0) valEnd = settingsJson.indexOf('}', valStart);
       if (valEnd > valStart) {
         int fs = settingsJson.substring(valStart, valEnd).toInt();
-        if (fs == 8 || fs == 10 || fs == 12 || fs == 14) {
+        if (fs == 12 || fs == 14 || fs == 16 || fs == 18 || fs == 20) {
           if (fs != g_settings.fontSize) {
             // Save original font size before applying change
             if (wasReading && layoutChanged == false) {
@@ -1319,20 +1449,172 @@ static const LayoutMetrics& getMetrics() {
   return g_metrics;
 }
 
-static void applyFontSize(int sz) {
-  switch (sz) {
-    case 8:  MAIN_FONT = u8g2_font_helvR08_te; BOLD_FONT = u8g2_font_helvB08_te; break;
-    case 10: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; break;
-    case 12: MAIN_FONT = u8g2_font_helvR12_te; BOLD_FONT = u8g2_font_helvB12_te; break;
-    case 14: MAIN_FONT = u8g2_font_helvR14_te; BOLD_FONT = u8g2_font_helvB14_te; break;
-    default: MAIN_FONT = u8g2_font_helvR10_te; BOLD_FONT = u8g2_font_helvB10_te; sz = 10; break;
+// Helper to get font pointer based on family, size, and weight
+static const uint8_t* getMainFont(int fam, int sz, int wt) {
+  if (fam == 0) {  // Atkinson
+    if (wt == 0) {  // regular
+      if (sz == 12) return u8g2_font_atkinson_regular_12;
+      if (sz == 14) return u8g2_font_atkinson_regular_14;
+      if (sz == 16) return u8g2_font_atkinson_regular_16;
+      if (sz == 18) return u8g2_font_atkinson_regular_18;
+      if (sz == 20) return u8g2_font_atkinson_regular_20;
+    } else if (wt == 1) {  // medium
+      if (sz == 12) return u8g2_font_atkinson_medium_12;
+      if (sz == 14) return u8g2_font_atkinson_medium_14;
+      if (sz == 16) return u8g2_font_atkinson_medium_16;
+      if (sz == 18) return u8g2_font_atkinson_medium_18;
+      if (sz == 20) return u8g2_font_atkinson_medium_20;
+    } else if (wt == 2) {  // semibold
+      if (sz == 12) return u8g2_font_atkinson_semibold_12;
+      if (sz == 14) return u8g2_font_atkinson_semibold_14;
+      if (sz == 16) return u8g2_font_atkinson_semibold_16;
+      if (sz == 18) return u8g2_font_atkinson_semibold_18;
+      if (sz == 20) return u8g2_font_atkinson_semibold_20;
+    } else if (wt == 3) {  // bold
+      if (sz == 12) return u8g2_font_atkinson_bold_12;
+      if (sz == 14) return u8g2_font_atkinson_bold_14;
+      if (sz == 16) return u8g2_font_atkinson_bold_16;
+      if (sz == 18) return u8g2_font_atkinson_bold_18;
+      if (sz == 20) return u8g2_font_atkinson_bold_20;
+    } else if (wt == 4) {  // extrabold
+      if (sz == 12) return u8g2_font_atkinson_extrabold_12;
+      if (sz == 14) return u8g2_font_atkinson_extrabold_14;
+      if (sz == 16) return u8g2_font_atkinson_extrabold_16;
+      if (sz == 18) return u8g2_font_atkinson_extrabold_18;
+      if (sz == 20) return u8g2_font_atkinson_extrabold_20;
+    }
+  } else if (fam == 1) {  // Noto Sans
+    if (wt == 0) {  // regular
+      if (sz == 12) return u8g2_font_notosans_regular_12;
+      if (sz == 14) return u8g2_font_notosans_regular_14;
+      if (sz == 16) return u8g2_font_notosans_regular_16;
+      if (sz == 18) return u8g2_font_notosans_regular_18;
+      if (sz == 20) return u8g2_font_notosans_regular_20;
+    } else if (wt == 1) {  // medium
+      if (sz == 12) return u8g2_font_notosans_medium_12;
+      if (sz == 14) return u8g2_font_notosans_medium_14;
+      if (sz == 16) return u8g2_font_notosans_medium_16;
+      if (sz == 18) return u8g2_font_notosans_medium_18;
+      if (sz == 20) return u8g2_font_notosans_medium_20;
+    } else if (wt == 2) {  // semibold
+      if (sz == 12) return u8g2_font_notosans_semibold_12;
+      if (sz == 14) return u8g2_font_notosans_semibold_14;
+      if (sz == 16) return u8g2_font_notosans_semibold_16;
+      if (sz == 18) return u8g2_font_notosans_semibold_18;
+      if (sz == 20) return u8g2_font_notosans_semibold_20;
+    } else if (wt == 3) {  // bold
+      if (sz == 12) return u8g2_font_notosans_bold_12;
+      if (sz == 14) return u8g2_font_notosans_bold_14;
+      if (sz == 16) return u8g2_font_notosans_bold_16;
+      if (sz == 18) return u8g2_font_notosans_bold_18;
+      if (sz == 20) return u8g2_font_notosans_bold_20;
+    } else if (wt == 4) {  // extrabold
+      if (sz == 12) return u8g2_font_notosans_extrabold_12;
+      if (sz == 14) return u8g2_font_notosans_extrabold_14;
+      if (sz == 16) return u8g2_font_notosans_extrabold_16;
+      if (sz == 18) return u8g2_font_notosans_extrabold_18;
+      if (sz == 20) return u8g2_font_notosans_extrabold_20;
+    }
+  } else if (fam == 2) {  // Noto Serif
+    if (wt == 0) {  // regular
+      if (sz == 12) return u8g2_font_notoserif_regular_12;
+      if (sz == 14) return u8g2_font_notoserif_regular_14;
+      if (sz == 16) return u8g2_font_notoserif_regular_16;
+      if (sz == 18) return u8g2_font_notoserif_regular_18;
+      if (sz == 20) return u8g2_font_notoserif_regular_20;
+    } else if (wt == 1) {  // medium
+      if (sz == 12) return u8g2_font_notoserif_medium_12;
+      if (sz == 14) return u8g2_font_notoserif_medium_14;
+      if (sz == 16) return u8g2_font_notoserif_medium_16;
+      if (sz == 18) return u8g2_font_notoserif_medium_18;
+      if (sz == 20) return u8g2_font_notoserif_medium_20;
+    } else if (wt == 2) {  // semibold
+      if (sz == 12) return u8g2_font_notoserif_semibold_12;
+      if (sz == 14) return u8g2_font_notoserif_semibold_14;
+      if (sz == 16) return u8g2_font_notoserif_semibold_16;
+      if (sz == 18) return u8g2_font_notoserif_semibold_18;
+      if (sz == 20) return u8g2_font_notoserif_semibold_20;
+    } else if (wt == 3) {  // bold
+      if (sz == 12) return u8g2_font_notoserif_bold_12;
+      if (sz == 14) return u8g2_font_notoserif_bold_14;
+      if (sz == 16) return u8g2_font_notoserif_bold_16;
+      if (sz == 18) return u8g2_font_notoserif_bold_18;
+      if (sz == 20) return u8g2_font_notoserif_bold_20;
+    } else if (wt == 4) {  // extrabold
+      if (sz == 12) return u8g2_font_notoserif_extrabold_12;
+      if (sz == 14) return u8g2_font_notoserif_extrabold_14;
+      if (sz == 16) return u8g2_font_notoserif_extrabold_16;
+      if (sz == 18) return u8g2_font_notoserif_extrabold_18;
+      if (sz == 20) return u8g2_font_notoserif_extrabold_20;
+    }
   }
+  // Default fallback
+  if (fam == 0) return u8g2_font_atkinson_regular_12;
+  if (fam == 1) return u8g2_font_notosans_regular_12;
+  return u8g2_font_notoserif_regular_12;
+}
+
+// Helper to get bold font pointer based on family and size (always uses extrabold weight)
+static const uint8_t* getBoldFont(int fam, int sz) {
+  if (fam == 0) {  // Atkinson
+    if (sz == 12) return u8g2_font_atkinson_extrabold_12;
+    if (sz == 14) return u8g2_font_atkinson_extrabold_14;
+    if (sz == 16) return u8g2_font_atkinson_extrabold_16;
+    if (sz == 18) return u8g2_font_atkinson_extrabold_18;
+    if (sz == 20) return u8g2_font_atkinson_extrabold_20;
+  } else if (fam == 1) {  // Noto Sans
+    if (sz == 12) return u8g2_font_notosans_extrabold_12;
+    if (sz == 14) return u8g2_font_notosans_extrabold_14;
+    if (sz == 16) return u8g2_font_notosans_extrabold_16;
+    if (sz == 18) return u8g2_font_notosans_extrabold_18;
+    if (sz == 20) return u8g2_font_notosans_extrabold_20;
+  } else if (fam == 2) {  // Noto Serif
+    if (sz == 12) return u8g2_font_notoserif_extrabold_12;
+    if (sz == 14) return u8g2_font_notoserif_extrabold_14;
+    if (sz == 16) return u8g2_font_notoserif_extrabold_16;
+    if (sz == 18) return u8g2_font_notoserif_extrabold_18;
+    if (sz == 20) return u8g2_font_notoserif_extrabold_20;
+  }
+  // Default fallback
+  return u8g2_font_atkinson_extrabold_12;
+}
+
+static void applyFontSize(int sz) {
+  int family = g_settings.fontFamily;
+  int weight = g_settings.fontWeight;
+  
+  // Validate size
+  if (sz != 12 && sz != 14 && sz != 16 && sz != 18 && sz != 20) {
+    sz = 12;
+  }
+  
+  // Validate family
+  if (family < 0 || family > 2) {
+    family = 0;
+  }
+  
+  // Validate weight
+  if (weight < 0 || weight > 4) {
+    weight = 0;
+  }
+  
+  MAIN_FONT = getMainFont(family, sz, weight);
+  BOLD_FONT = getBoldFont(family, sz);
+  
   g_settings.fontSize = sz;
+  g_settings.fontFamily = family;
+  g_settings.fontWeight = weight;
   invalidateMetrics();
 }
 
 static void loadSettings() {
-  applyFontSize(prefs.getInt("cfg_font", 8));
+  g_settings.fontFamily = prefs.getInt("cfg_font_family", 0);
+  if (g_settings.fontFamily < 0 || g_settings.fontFamily > 2) g_settings.fontFamily = 0;
+  
+  g_settings.fontWeight = prefs.getInt("cfg_font_weight", 0);
+  if (g_settings.fontWeight < 0 || g_settings.fontWeight > 4) g_settings.fontWeight = 0;
+  
+  applyFontSize(prefs.getInt("cfg_font", 12));
 
   g_settings.sleepSecs = (uint32_t)prefs.getInt("cfg_sleep", 120);
   if (g_settings.sleepSecs < 10) g_settings.sleepSecs = 10;
