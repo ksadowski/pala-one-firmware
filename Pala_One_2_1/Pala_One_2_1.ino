@@ -100,6 +100,33 @@ DisplayType display;
 #include "fonts/noto_serif_extrabold_18.c"
 #include "fonts/noto_serif_extrabold_20.c"
 
+// Literata
+#include "fonts/literata_regular_12.c"
+#include "fonts/literata_regular_14.c"
+#include "fonts/literata_regular_16.c"
+#include "fonts/literata_regular_18.c"
+#include "fonts/literata_regular_20.c"
+#include "fonts/literata_medium_12.c"
+#include "fonts/literata_medium_14.c"
+#include "fonts/literata_medium_16.c"
+#include "fonts/literata_medium_18.c"
+#include "fonts/literata_medium_20.c"
+#include "fonts/literata_semibold_12.c"
+#include "fonts/literata_semibold_14.c"
+#include "fonts/literata_semibold_16.c"
+#include "fonts/literata_semibold_18.c"
+#include "fonts/literata_semibold_20.c"
+#include "fonts/literata_bold_12.c"
+#include "fonts/literata_bold_14.c"
+#include "fonts/literata_bold_16.c"
+#include "fonts/literata_bold_18.c"
+#include "fonts/literata_bold_20.c"
+#include "fonts/literata_extrabold_12.c"
+#include "fonts/literata_extrabold_14.c"
+#include "fonts/literata_extrabold_16.c"
+#include "fonts/literata_extrabold_18.c"
+#include "fonts/literata_extrabold_20.c"
+
 #include <Preferences.h>
 
 #include <LittleFS.h>
@@ -230,7 +257,7 @@ struct RuntimeSettings {
   uint32_t sleepSecs = 120;
   int lineGap = 0;
   int readerLongPressAction = LONGPRESS_BOOKMARK;
-  int fontFamily = 0;  // 0=atkinson, 1=noto_sans, 2=noto_serif
+  int fontFamily = 0;  // 0=atkinson, 1=literata, 2=noto_sans, 3=noto_serif
   int fontWeight = 0;  // 0=regular, 1=medium, 2=semibold, 3=bold, 4=extrabold
 };
 
@@ -572,10 +599,14 @@ class PalaBLEServerCallbacks : public BLEServerCallbacks {
     g_bleConnected = true;
     lastUserActionMs = millis(); // Reset sleep timer on connect
     sendBLEStatus("connected");
+    Serial.println("[BLE] Connection established");
+    // Note: PHY mode is negotiated automatically during connection
+    // The ESP32 BLE library being used doesn't expose PHY mode directly
   }
   void onDisconnect(BLEServer* pServer) {
     g_bleConnected = false;
     sendBLEStatus("disconnected");
+    Serial.println("[BLE] Disconnected");
     // Restart advertising after disconnect
     BLEDevice::startAdvertising();
   }
@@ -660,9 +691,10 @@ class BLEDataCallbacks : public BLECharacteristicCallbacks {
               if (FS.exists(finalPath)) FS.remove(finalPath);
               if (FS.rename(tmpPath, finalPath)) {
                 Serial.println("[BLE Upload] App upload complete");
-                sendBLEStatus("upload_complete");
+                sendBLEStatus("app_upload_complete");
                 scanApps(); // Reload device's internal app list
                 if (mode == MODE_APPS) drawAppsMenu(); // Refresh display if in apps mode
+                sendBLEStatus("apps_reloaded");
                 g_uploadIsApp = false;
               } else {
                 Serial.println("[BLE Upload] Failed to finalize app upload");
@@ -729,7 +761,7 @@ class BLEDataCallbacks : public BLECharacteristicCallbacks {
                 Serial.println("[BLE Upload] Failed to remove temp file");
               }
               Serial.println("[BLE Upload] Upload complete");
-              sendBLEStatus("upload_complete");
+              sendBLEStatus("file_upload_complete");
               // Defer library reload to avoid crash in BLE callback
               g_reloadLibrary = true;
             } else {
@@ -778,7 +810,7 @@ static void handleBLECommand(std::string cmd) {
       g_bleCharData->setValue(json.c_str());
       g_bleCharData->notify();
     }
-    sendBLEStatus("list_sent");
+    sendBLEStatus("files_list_sent");
   }
   else if (command == "LIST_APPS") {
     // Return JSON list of apps
@@ -962,7 +994,7 @@ static void handleBLECommand(std::string cmd) {
       if (valEnd < 0) valEnd = settingsJson.indexOf('}', valStart);
       if (valEnd > valStart) {
         int ff = settingsJson.substring(valStart, valEnd).toInt();
-        if (ff >= 0 && ff <= 2) {
+        if (ff >= 0 && ff <= 3) {
           if (ff != g_settings.fontFamily) {
             g_settings.fontFamily = ff;
             prefs.putInt("cfg_font_family", ff);
@@ -1327,15 +1359,17 @@ static void handleBLECommand(std::string cmd) {
       }
 
       if (FS.remove(path)) {
-        sendBLEStatus("delete_success");
         // For books, defer library reload. For apps, reload app list
         if (path.startsWith("/books/")) {
           g_reloadLibrary = true;
+          sendBLEStatus("file_delete_success");
           Serial.println("[BLE] File removed successfully, deferred library reload");
         } else if (path.startsWith("/apps/")) {
+          sendBLEStatus("app_delete_success");
           scanApps();
           if (mode == MODE_APPS) drawAppsMenu(); // Refresh display if in apps mode
           Serial.println("[BLE] File removed successfully, apps reloaded");
+          sendBLEStatus("apps_reloaded");
         } else {
           Serial.println("[BLE] File removed successfully");
         }
@@ -1458,7 +1492,39 @@ static const uint8_t* getMainFont(int fam, int sz, int wt) {
       if (sz == 18) return u8g2_font_atkinson_extrabold_18;
       if (sz == 20) return u8g2_font_atkinson_extrabold_20;
     }
-  } else if (fam == 1) {  // Noto Sans
+  } else if (fam == 1) {  // Literata
+    if (wt == 0) {  // regular
+      if (sz == 12) return u8g2_font_literata_regular_12;
+      if (sz == 14) return u8g2_font_literata_regular_14;
+      if (sz == 16) return u8g2_font_literata_regular_16;
+      if (sz == 18) return u8g2_font_literata_regular_18;
+      if (sz == 20) return u8g2_font_literata_regular_20;
+    } else if (wt == 1) {  // medium
+      if (sz == 12) return u8g2_font_literata_medium_12;
+      if (sz == 14) return u8g2_font_literata_medium_14;
+      if (sz == 16) return u8g2_font_literata_medium_16;
+      if (sz == 18) return u8g2_font_literata_medium_18;
+      if (sz == 20) return u8g2_font_literata_medium_20;
+    } else if (wt == 2) {  // semibold
+      if (sz == 12) return u8g2_font_literata_semibold_12;
+      if (sz == 14) return u8g2_font_literata_semibold_14;
+      if (sz == 16) return u8g2_font_literata_semibold_16;
+      if (sz == 18) return u8g2_font_literata_semibold_18;
+      if (sz == 20) return u8g2_font_literata_semibold_20;
+    } else if (wt == 3) {  // bold
+      if (sz == 12) return u8g2_font_literata_bold_12;
+      if (sz == 14) return u8g2_font_literata_bold_14;
+      if (sz == 16) return u8g2_font_literata_bold_16;
+      if (sz == 18) return u8g2_font_literata_bold_18;
+      if (sz == 20) return u8g2_font_literata_bold_20;
+    } else if (wt == 4) {  // extrabold
+      if (sz == 12) return u8g2_font_literata_extrabold_12;
+      if (sz == 14) return u8g2_font_literata_extrabold_14;
+      if (sz == 16) return u8g2_font_literata_extrabold_16;
+      if (sz == 18) return u8g2_font_literata_extrabold_18;
+      if (sz == 20) return u8g2_font_literata_extrabold_20;
+    }
+  } else if (fam == 2) {  // Noto Sans
     if (wt == 0) {  // regular
       if (sz == 12) return u8g2_font_notosans_regular_12;
       if (sz == 14) return u8g2_font_notosans_regular_14;
@@ -1490,7 +1556,7 @@ static const uint8_t* getMainFont(int fam, int sz, int wt) {
       if (sz == 18) return u8g2_font_notosans_extrabold_18;
       if (sz == 20) return u8g2_font_notosans_extrabold_20;
     }
-  } else if (fam == 2) {  // Noto Serif
+  } else if (fam == 3) {  // Noto Serif
     if (wt == 0) {  // regular
       if (sz == 12) return u8g2_font_notoserif_regular_12;
       if (sz == 14) return u8g2_font_notoserif_regular_14;
@@ -1525,11 +1591,13 @@ static const uint8_t* getMainFont(int fam, int sz, int wt) {
   }
   // Default fallback
   if (fam == 0) return u8g2_font_atkinson_regular_12;
-  if (fam == 1) return u8g2_font_notosans_regular_12;
+  if (fam == 1) return u8g2_font_literata_regular_12;
+  if (fam == 2) return u8g2_font_notosans_regular_12;
   return u8g2_font_notoserif_regular_12;
 }
 
-// Helper to get bold font pointer based on family and size (always uses extrabold weight)
+// Helper to get bold font pointer based on family and size
+// All 4 fonts have extrabold
 static const uint8_t* getBoldFont(int fam, int sz) {
   if (fam == 0) {  // Atkinson
     if (sz == 12) return u8g2_font_atkinson_extrabold_12;
@@ -1537,13 +1605,19 @@ static const uint8_t* getBoldFont(int fam, int sz) {
     if (sz == 16) return u8g2_font_atkinson_extrabold_16;
     if (sz == 18) return u8g2_font_atkinson_extrabold_18;
     if (sz == 20) return u8g2_font_atkinson_extrabold_20;
-  } else if (fam == 1) {  // Noto Sans
+  } else if (fam == 1) {  // Literata
+    if (sz == 12) return u8g2_font_literata_extrabold_12;
+    if (sz == 14) return u8g2_font_literata_extrabold_14;
+    if (sz == 16) return u8g2_font_literata_extrabold_16;
+    if (sz == 18) return u8g2_font_literata_extrabold_18;
+    if (sz == 20) return u8g2_font_literata_extrabold_20;
+  } else if (fam == 2) {  // Noto Sans
     if (sz == 12) return u8g2_font_notosans_extrabold_12;
     if (sz == 14) return u8g2_font_notosans_extrabold_14;
     if (sz == 16) return u8g2_font_notosans_extrabold_16;
     if (sz == 18) return u8g2_font_notosans_extrabold_18;
     if (sz == 20) return u8g2_font_notosans_extrabold_20;
-  } else if (fam == 2) {  // Noto Serif
+  } else if (fam == 3) {  // Noto Serif
     if (sz == 12) return u8g2_font_notoserif_extrabold_12;
     if (sz == 14) return u8g2_font_notoserif_extrabold_14;
     if (sz == 16) return u8g2_font_notoserif_extrabold_16;
@@ -1564,7 +1638,7 @@ static void applyFontSize(int sz) {
   }
   
   // Validate family
-  if (family < 0 || family > 2) {
+  if (family < 0 || family > 3) {
     family = 0;
   }
   
@@ -1584,7 +1658,7 @@ static void applyFontSize(int sz) {
 
 static void loadSettings() {
   g_settings.fontFamily = prefs.getInt("cfg_font_family", 0);
-  if (g_settings.fontFamily < 0 || g_settings.fontFamily > 2) g_settings.fontFamily = 0;
+  if (g_settings.fontFamily < 0 || g_settings.fontFamily > 3) g_settings.fontFamily = 0;
   
   g_settings.fontWeight = prefs.getInt("cfg_font_weight", 0);
   if (g_settings.fontWeight < 0 || g_settings.fontWeight > 4) g_settings.fontWeight = 0;
