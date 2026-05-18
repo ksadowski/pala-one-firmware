@@ -1200,9 +1200,9 @@ static void handleBLECommand(std::string cmd) {
           Serial.print("[BLE] Bookmark view JSON: ");
           Serial.println(json);
 
-          // Send JSON in chunks to handle BLE MTU limitations
+          // Send JSON in chunks sized to negotiated MTU
           int jsonLen = json.length();
-          int chunkSize = 20; // BLE MTU for notifications is typically 20-23 bytes
+          int chunkSize = 512;
           for (int offset = 0; offset < jsonLen; offset += chunkSize) {
             int endIdx = min(offset + chunkSize, jsonLen);
             String chunk = json.substring(offset, endIdx);
@@ -1210,7 +1210,7 @@ static void handleBLECommand(std::string cmd) {
               g_bleCharData->setValue(chunk.c_str());
               g_bleCharData->notify();
             }
-            delay(20); // Small delay between chunks
+            delay(10);
           }
           sendBLEStatus("bookmark_view_sent");
         } else {
@@ -1391,6 +1391,7 @@ static void setupBLE() {
   // Initialize BLE
   Serial.println("[BLE] Initializing BLE...");
   BLEDevice::init("Pala One");
+  BLEDevice::setMTU(517); // Request 512-byte payload MTU (517 = 512 data + 3 ATT header)
   Serial.println("[BLE] Device name set to 'Pala One'");
 
   // Create BLE server
@@ -1412,6 +1413,7 @@ static void setupBLE() {
     PALA_BLE_CHAR_DATA_UUID,
     BLECharacteristic::PROPERTY_READ |
     BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_WRITE_NR |
     BLECharacteristic::PROPERTY_NOTIFY
   );
   g_bleCharData->setCallbacks(new BLEDataCallbacks());
@@ -1431,8 +1433,8 @@ static void setupBLE() {
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(PALA_BLE_SERVICE_UUID);
   pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);
-  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->setMinPreferred(0x06); // 7.5 ms minimum connection interval
+  pAdvertising->setMaxPreferred(0x12); // 22.5 ms maximum connection interval
   BLEDevice::startAdvertising();
   Serial.println("[BLE] Advertising started");
 }
@@ -4966,8 +4968,8 @@ void loop() {
     Serial.print("[BLE] JSON length: ");
     Serial.println(json.length());
 
-    // Send JSON in chunks to avoid BLE MTU truncation
-    const int maxChunkSize = 200; // Conservative chunk size
+    // Send JSON in chunks sized to negotiated MTU
+    const int maxChunkSize = 512;
     int jsonLen = json.length();
     int offset = 0;
     int chunkNum = 0;
@@ -4988,11 +4990,10 @@ void loop() {
       Serial.print(" (");
       Serial.print(chunkSize);
       Serial.println(" bytes)");
-      delay(50); // Increased delay between chunks
+      delay(10);
     }
 
-    // Additional delay before sending status to ensure all chunks are delivered
-    delay(100);
+    delay(20);
 
     sendBLEStatus("all_bookmarks_sent");
     g_fetchAllBookmarks = false;
