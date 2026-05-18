@@ -487,6 +487,14 @@ static uint32_t g_bleTransferTotalSize = 0;
 static uint32_t g_bleTransferBytesSent = 0;
 static const uint32_t BLE_CHUNK_SIZE = 512; // Safe chunk size for BLE
 
+// RAM ring buffer for BLE upload (SPSC: onWrite produces, main loop consumes)
+static const uint32_t BLE_RAM_BUF_SIZE = 16384; // 16 KB — must be a power of 2
+static uint8_t        g_bleRamBuf[BLE_RAM_BUF_SIZE];
+static volatile uint32_t g_bleRamBufHead = 0;   // written only by BLE task (onWrite)
+static volatile uint32_t g_bleRamBufTail = 0;   // written only by main loop
+static volatile bool  g_bleAllReceived = false;  // all bytes landed in RAM buffer
+static bool           g_finalizeUpload = false;  // triggers post-transfer work in main loop
+
 static const uint8_t BTN_Q = 64;
 static const uint32_t BTN_QUEUE_RECOVER_THRESHOLD = 10;
 volatile uint8_t btnQHead = 0;
@@ -626,154 +634,43 @@ class BLECommandCallbacks : public BLECharacteristicCallbacks {
 
 class BLEDataCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) {
-    Serial.print("[BLE Data] Write callback, transfer state: ");
-    Serial.println(g_bleTransferState);
+    if (g_bleTransferState != BLE_TRANSFER_UPLOADING) return;
 
-    if (g_bleTransferState == BLE_TRANSFER_UPLOADING && g_bleTransferFile) {
-      // Reset sleep timer to prevent sleep during upload
-      lastUserActionMs = millis();
+    lastUserActionMs = millis();
 
-      String arduinoData = pCharacteristic->getValue();
-      std::string data = std::string(arduinoData.c_str(), arduinoData.length());
-      Serial.print("[BLE Data] Received chunk size: ");
-      Serial.println(data.length());
+    String arduinoData = pCharacteristic->getValue();
+    uint32_t len = (uint32_t)arduinoData.length();
+    if (len == 0) return;
 
-      if (data.length() > 0) {
-        g_bleTransferFile.write((const uint8_t*)data.data(), data.length());
-        g_bleTransferOffset += data.length();
+    const uint8_t* src = (const uint8_t*)arduinoData.c_str();
 
-        Serial.print("[BLE Upload] Received chunk: ");
-        Serial.print(g_bleTransferOffset);
-        Serial.print("/");
-        Serial.print(g_bleTransferTotalSize);
-        Serial.println(" bytes");
+    // Check ring buffer capacity (head - tail = bytes currently buffered)
+    uint32_t used = g_bleRamBufHead - g_bleRamBufTail;
+    if (BLE_RAM_BUF_SIZE - used < len) {
+      Serial.println("[BLE Upload] RAM buffer full, dropping chunk");
+      return;
+    }
 
-        // Send ACK with offset
-        String ack = "ACK:" + String(g_bleTransferOffset);
-        Serial.print("[BLE Upload] Sending ACK: ");
-        Serial.println(ack);
-        sendBLEStatus(ack.c_str());
+    // Write into ring buffer, handling wrap-around
+    uint32_t idx = g_bleRamBufHead & (BLE_RAM_BUF_SIZE - 1);
+    if (idx + len <= BLE_RAM_BUF_SIZE) {
+      memcpy(g_bleRamBuf + idx, src, len);
+    } else {
+      uint32_t part1 = BLE_RAM_BUF_SIZE - idx;
+      memcpy(g_bleRamBuf + idx, src, part1);
+      memcpy(g_bleRamBuf,       src + part1, len - part1);
+    }
+    g_bleRamBufHead += len; // publish to main loop
 
-        // Yield to watchdog
-        yield();
+    g_bleTransferOffset += len;
 
-        // Check if transfer complete
-        if (g_bleTransferOffset >= g_bleTransferTotalSize) {
-          Serial.println("[BLE Upload] Transfer complete");
-          g_bleTransferFile.close();
-          g_bleTransferState = BLE_TRANSFER_IDLE;
+    // ACK immediately — flash write happens in main loop
+    String ack = "ACK:" + String(g_bleTransferOffset);
+    sendBLEStatus(ack.c_str());
 
-          if (g_uploadIsApp) {
-            // App upload - validate and finalize binary file
-            Serial.println("[BLE Upload] Validating app binary...");
-            String tmpPath = g_bleTransferPath + ".tmp";
-            String finalPath = g_bleTransferPath;
-
-            // Validate magic number and size
-            bool valid = false;
-            File vf = FS.open(tmpPath, "r");
-            if (vf) {
-              if (vf.size() >= sizeof(PalaAppHeader)) {
-                PalaAppHeader hdr;
-                if (vf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr)) {
-                  if (hdr.magic == PALA_APP_MAGIC) {
-                    valid = true;
-                    Serial.println("[BLE Upload] App magic number valid");
-                  } else {
-                    Serial.println("[BLE Upload] Invalid app magic number");
-                  }
-                }
-              }
-              vf.close();
-            }
-
-            if (valid) {
-              if (FS.exists(finalPath)) FS.remove(finalPath);
-              if (FS.rename(tmpPath, finalPath)) {
-                Serial.println("[BLE Upload] App upload complete");
-                sendBLEStatus("app_upload_complete");
-                scanApps(); // Reload device's internal app list
-                if (mode == MODE_APPS) drawAppsMenu(); // Refresh display if in apps mode
-                sendBLEStatus("apps_reloaded");
-                g_uploadIsApp = false;
-              } else {
-                Serial.println("[BLE Upload] Failed to finalize app upload");
-                if (FS.exists(tmpPath)) FS.remove(tmpPath);
-                sendBLEStatus("upload_error:rename_failed");
-                g_uploadIsApp = false;
-              }
-            } else {
-              Serial.println("[BLE Upload] App validation failed");
-              if (FS.exists(tmpPath)) FS.remove(tmpPath);
-              sendBLEStatus("upload_error:invalid_app");
-              g_uploadIsApp = false;
-            }
-          } else {
-            // Book upload - apply normalization like HTTP upload
-            Serial.println("[BLE Upload] Normalizing file...");
-            String tmpPath = g_bleTransferPath + ".tmp";
-            String finalPath = g_bleTransferPath;
-
-            // Read, normalize, and rewrite file
-            Serial.print("[BLE Upload] Normalizing file: ");
-            Serial.println(tmpPath.c_str());
-            File tmpFile = FS.open(tmpPath, "r");
-            File finalFile = FS.open(finalPath, "w");
-            if (tmpFile && finalFile) {
-              String pendingUtf8Tail = "";
-              int chunkCount = 0;
-              while (tmpFile.available()) {
-                uint8_t buf[512];
-                int bytesRead = tmpFile.read(buf, 512);
-                if (bytesRead > 0) {
-                  String chunk = pendingUtf8Tail + String((const char*)buf, bytesRead);
-                  int len = (int)chunk.length();
-                  if (len > 4) {
-                    pendingUtf8Tail = chunk.substring(len - 4);
-                    chunk = chunk.substring(0, len - 4);
-                  } else {
-                    pendingUtf8Tail = chunk;
-                    chunk = "";
-                  }
-                  if (chunk.length() > 0) {
-                    String cleaned = normalizeTypography(chunk);
-                    cleaned = compactText(cleaned);
-                    finalFile.print(cleaned);
-                  }
-                }
-                // Yield to watchdog every few chunks
-                if (++chunkCount % 10 == 0) {
-                  yield();
-                }
-              }
-              if (pendingUtf8Tail.length() > 0) {
-                String cleaned = normalizeTypography(pendingUtf8Tail);
-                cleaned = compactText(cleaned);
-                finalFile.print(cleaned);
-              }
-              tmpFile.close();
-              finalFile.close();
-              Serial.print("[BLE Upload] Removing temp file: ");
-              Serial.println(tmpPath.c_str());
-              if (FS.remove(tmpPath)) {
-                Serial.println("[BLE Upload] Temp file removed successfully");
-              } else {
-                Serial.println("[BLE Upload] Failed to remove temp file");
-              }
-              Serial.println("[BLE Upload] Upload complete");
-              sendBLEStatus("file_upload_complete");
-              // Defer library reload to avoid crash in BLE callback
-              g_reloadLibrary = true;
-            } else {
-              Serial.println("[BLE Upload] Failed to open files for normalization");
-              if (tmpFile) tmpFile.close();
-              if (finalFile) finalFile.close();
-              FS.remove(tmpPath);
-              sendBLEStatus("upload_error:file_open");
-            }
-          }
-        }
-      }
+    if (g_bleTransferOffset >= g_bleTransferTotalSize) {
+      Serial.println("[BLE Upload] All bytes received into RAM buffer");
+      g_bleAllReceived = true;
     }
   }
 };
@@ -5029,6 +4926,10 @@ void loop() {
         g_bleTransferOffset = 0;
         g_bleTransferTotalSize = g_uploadSize;
         g_bleTransferBytesSent = 0;
+        g_bleRamBufHead = 0;
+        g_bleRamBufTail = 0;
+        g_bleAllReceived = false;
+        g_finalizeUpload = false;
         g_bleTransferState = BLE_TRANSFER_UPLOADING;
         Serial.println("[BLE] Sending upload_ready status");
         sendBLEStatus("upload_ready");
@@ -5039,6 +4940,125 @@ void loop() {
       g_uploadPath = "";
       g_uploadSize = 0;
       g_initUpload = false;
+    }
+  }
+
+  // Flush BLE RAM ring buffer to flash in 4 KB batches
+  if (g_bleTransferState == BLE_TRANSFER_UPLOADING) {
+    static const uint32_t FLUSH_THRESHOLD = 4096;
+    uint32_t buffered = g_bleRamBufHead - g_bleRamBufTail;
+    bool shouldFlush = (buffered >= FLUSH_THRESHOLD) ||
+                       (g_bleAllReceived && buffered > 0);
+
+    if (shouldFlush) {
+      uint32_t toFlush = (buffered > FLUSH_THRESHOLD) ? FLUSH_THRESHOLD : buffered;
+      uint32_t idx = g_bleRamBufTail & (BLE_RAM_BUF_SIZE - 1);
+
+      if (idx + toFlush <= BLE_RAM_BUF_SIZE) {
+        g_bleTransferFile.write(g_bleRamBuf + idx, toFlush);
+      } else {
+        uint32_t part1 = BLE_RAM_BUF_SIZE - idx;
+        g_bleTransferFile.write(g_bleRamBuf + idx, part1);
+        g_bleTransferFile.write(g_bleRamBuf,        toFlush - part1);
+      }
+      g_bleRamBufTail += toFlush;
+
+      if (g_bleAllReceived && g_bleRamBufHead == g_bleRamBufTail) {
+        Serial.println("[BLE Upload] All data flushed to flash, finalizing");
+        g_bleTransferFile.close();
+        g_bleTransferState = BLE_TRANSFER_IDLE;
+        g_finalizeUpload = true;
+      }
+    }
+  }
+
+  // Post-transfer finalization (validation / normalization)
+  if (g_finalizeUpload) {
+    g_finalizeUpload = false;
+
+    if (g_uploadIsApp) {
+      String tmpPath = g_bleTransferPath + ".tmp";
+      String finalPath = g_bleTransferPath;
+      Serial.println("[BLE Upload] Validating app binary...");
+
+      bool valid = false;
+      File vf = FS.open(tmpPath, "r");
+      if (vf) {
+        if (vf.size() >= sizeof(PalaAppHeader)) {
+          PalaAppHeader hdr;
+          if (vf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr)) {
+            valid = (hdr.magic == PALA_APP_MAGIC);
+          }
+        }
+        vf.close();
+      }
+
+      if (valid) {
+        if (FS.exists(finalPath)) FS.remove(finalPath);
+        if (FS.rename(tmpPath, finalPath)) {
+          Serial.println("[BLE Upload] App upload complete");
+          sendBLEStatus("app_upload_complete");
+          scanApps();
+          if (mode == MODE_APPS) drawAppsMenu();
+          sendBLEStatus("apps_reloaded");
+        } else {
+          if (FS.exists(tmpPath)) FS.remove(tmpPath);
+          sendBLEStatus("upload_error:rename_failed");
+        }
+      } else {
+        if (FS.exists(tmpPath)) FS.remove(tmpPath);
+        sendBLEStatus("upload_error:invalid_app");
+      }
+      g_uploadIsApp = false;
+
+    } else {
+      String tmpPath = g_bleTransferPath + ".tmp";
+      String finalPath = g_bleTransferPath;
+      Serial.println("[BLE Upload] Normalizing book file...");
+
+      File tmpFile = FS.open(tmpPath, "r");
+      File finalFile = FS.open(finalPath, "w");
+      if (tmpFile && finalFile) {
+        String pendingUtf8Tail = "";
+        int chunkCount = 0;
+        while (tmpFile.available()) {
+          uint8_t buf[512];
+          int bytesRead = tmpFile.read(buf, 512);
+          if (bytesRead > 0) {
+            String chunk = pendingUtf8Tail + String((const char*)buf, bytesRead);
+            int len = (int)chunk.length();
+            if (len > 4) {
+              pendingUtf8Tail = chunk.substring(len - 4);
+              chunk = chunk.substring(0, len - 4);
+            } else {
+              pendingUtf8Tail = chunk;
+              chunk = "";
+            }
+            if (chunk.length() > 0) {
+              String cleaned = normalizeTypography(chunk);
+              cleaned = compactText(cleaned);
+              finalFile.print(cleaned);
+            }
+          }
+          if (++chunkCount % 10 == 0) yield();
+        }
+        if (pendingUtf8Tail.length() > 0) {
+          String cleaned = normalizeTypography(pendingUtf8Tail);
+          cleaned = compactText(cleaned);
+          finalFile.print(cleaned);
+        }
+        tmpFile.close();
+        finalFile.close();
+        FS.remove(tmpPath);
+        Serial.println("[BLE Upload] Book upload complete");
+        sendBLEStatus("file_upload_complete");
+        g_reloadLibrary = true;
+      } else {
+        if (tmpFile)  tmpFile.close();
+        if (finalFile) finalFile.close();
+        FS.remove(tmpPath);
+        sendBLEStatus("upload_error:file_open");
+      }
     }
   }
 
