@@ -512,6 +512,62 @@ void loop() {
     }
   }
 
+  // Handle deferred bookmark view (pagination needs main loop stack)
+  if (g_viewBookmark) {
+    String path = g_viewBookmarkPath;
+    int page = g_viewBookmarkPage;
+    g_viewBookmark = false;
+
+    String key = prefKeyForBook(path);
+    static uint16_t pages[MAX_BOOKMARKS];
+    static uint32_t offsets[MAX_BOOKMARKS];
+    uint8_t count = loadBookmarksForKey(key, pages, offsets);
+
+    uint32_t offset = 0xFFFFFFFF;
+    for (uint8_t i = 0; i < count; i++) {
+      if ((int)pages[i] == page) { offset = offsets[i]; break; }
+    }
+
+    if (offset == 0xFFFFFFFF) {
+      sendBLEStatus("bookmark_not_found");
+    } else {
+      File f = FS.open(path, "r");
+      if (f) {
+        uint32_t resolvedOffset = resolveBookmarkOffset(path, (uint16_t)page, offset);
+        String txt;
+        txt.reserve(900);
+        readPageFromFile(f, resolvedOffset, false, &txt);
+        f.close();
+        txt.trim();
+        if (txt.length() == 0) txt = "(empty)";
+
+        String json = "{\"path\":\"" + path + "\",\"page\":" + String(page) + ",\"text\":\"";
+        txt.replace("\\", "\\\\");
+        txt.replace("\"", "\\\"");
+        txt.replace("\n", "\\n");
+        txt.replace("\r", "\\r");
+        txt.replace("\t", "\\t");
+        json += txt + "\"}";
+        Serial.print("[BLE] Bookmark view JSON: "); Serial.println(json);
+
+        int jsonLen = json.length();
+        int chunkSize = 512;
+        for (int offset = 0; offset < jsonLen; offset += chunkSize) {
+          int endIdx = min(offset + chunkSize, jsonLen);
+          String chunk = json.substring(offset, endIdx);
+          if (g_bleCharData && g_bleConnected) {
+            g_bleCharData->setValue(chunk.c_str());
+            g_bleCharData->notify();
+          }
+          delay(10);
+        }
+        sendBLEStatus("bookmark_view_sent");
+      } else {
+        sendBLEStatus("file_open_failed");
+      }
+    }
+  }
+
   // Keep device awake while BLE connected to companion
   if (g_bleConnected) {
     lastUserActionMs = millis();

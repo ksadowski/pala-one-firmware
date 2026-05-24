@@ -48,6 +48,9 @@ bool     g_uploadIsApp       = false;
 bool     g_uploadIsBinary    = false;
 String   g_uploadPath;
 uint32_t g_uploadSize        = 0;
+bool     g_viewBookmark      = false;
+String   g_viewBookmarkPath;
+int      g_viewBookmarkPage  = 0;
 
 // BLE transfer state
 BLETransferState  g_bleTransferState    = BLE_TRANSFER_IDLE;

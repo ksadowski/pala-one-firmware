@@ -437,8 +437,8 @@ void handleBLECommand(std::string cmd) {
   else if (command.startsWith("GET_BOOKMARKS:")) {
     String path = command.substring(14);
     String key = prefKeyForBook(path);
-    uint16_t pages[MAX_BOOKMARKS];
-    uint32_t offsets[MAX_BOOKMARKS];
+    static uint16_t pages[MAX_BOOKMARKS];
+    static uint32_t offsets[MAX_BOOKMARKS];
     uint8_t count = loadBookmarksForKey(key, pages, offsets);
 
     File f;
@@ -480,56 +480,10 @@ void handleBLECommand(std::string cmd) {
       String path = params.substring(0, colonIdx);
       int page = params.substring(colonIdx + 1).toInt();
 
-      String key = prefKeyForBook(path);
-      uint16_t pages[MAX_BOOKMARKS];
-      uint32_t offsets[MAX_BOOKMARKS];
-      uint8_t count = loadBookmarksForKey(key, pages, offsets);
-
-      uint32_t offset = 0xFFFFFFFF;
-      for (uint8_t i = 0; i < count; i++) {
-        if ((int)pages[i] == page) { offset = offsets[i]; break; }
-      }
-
-      if (offset == 0xFFFFFFFF) {
-        sendBLEStatus("bookmark_not_found");
-      } else {
-        File f = FS.open(path, "r");
-        if (f) {
-          uint32_t resolvedOffset = resolveBookmarkOffset(path, (uint16_t)page, offset);
-          String txt;
-          txt.reserve(900);
-          readPageFromFile(f, resolvedOffset, false, &txt);
-          f.close();
-          txt.trim();
-          if (txt.length() == 0) txt = "(empty)";
-
-          String json = "{\"path\":\"" + path + "\",\"page\":" + String(page) + ",\"text\":\"";
-          txt.replace("\\", "\\\\");
-          txt.replace("\"", "\\\"");
-          txt.replace("\n", "\\n");
-          txt.replace("\r", "\\r");
-          txt.replace("\t", "\\t");
-          json += txt + "\"}";
-          Serial.print("[BLE] Bookmark view JSON: "); Serial.println(json);
-
-          int jsonLen = json.length();
-          int chunkSize = 512;
-          for (int offset = 0; offset < jsonLen; offset += chunkSize) {
-            int endIdx = min(offset + chunkSize, jsonLen);
-            String chunk = json.substring(offset, endIdx);
-            if (g_bleCharData && g_bleConnected) {
-              g_bleCharData->setValue(chunk.c_str());
-              g_bleCharData->notify();
-            }
-            delay(10);
-          }
-          sendBLEStatus("bookmark_view_sent");
-        } else {
-          sendBLEStatus("file_open_failed");
-        }
-      }
-    } else {
-      sendBLEStatus("invalid_params");
+      g_viewBookmarkPath = path;
+      g_viewBookmarkPage = page;
+      g_viewBookmark = true;
+      Serial.println("[BLE] Deferred bookmark view to main loop");
     }
   }
   else if (command.startsWith("ADD_BOOKMARK:")) {
@@ -548,8 +502,8 @@ void handleBLECommand(std::string cmd) {
         int page    = bookmarkJson.substring(pageStart, pageEnd).toInt();
         String key  = prefKeyForBook(path);
 
-        uint16_t pages[MAX_BOOKMARKS];
-        uint32_t offsets[MAX_BOOKMARKS];
+        static uint16_t pages[MAX_BOOKMARKS];
+        static uint32_t offsets[MAX_BOOKMARKS];
         uint8_t count = loadBookmarksForKey(key, pages, offsets);
 
         bool exists = false;
@@ -587,8 +541,8 @@ void handleBLECommand(std::string cmd) {
         int page    = bookmarkJson.substring(pageStart, pageEnd).toInt();
         String key  = prefKeyForBook(path);
 
-        uint16_t pages[MAX_BOOKMARKS];
-        uint32_t offsets[MAX_BOOKMARKS];
+        static uint16_t pages[MAX_BOOKMARKS];
+        static uint32_t offsets[MAX_BOOKMARKS];
         uint8_t count = loadBookmarksForKey(key, pages, offsets);
 
         bool found = false;

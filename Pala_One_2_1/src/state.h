@@ -301,6 +301,9 @@ extern bool     g_uploadIsApp;
 extern bool     g_uploadIsBinary;
 extern String   g_uploadPath;
 extern uint32_t g_uploadSize;
+extern bool     g_viewBookmark;
+extern String   g_viewBookmarkPath;
+extern int      g_viewBookmarkPage;
 
 // BLE transfer state
 extern BLETransferState  g_bleTransferState;
