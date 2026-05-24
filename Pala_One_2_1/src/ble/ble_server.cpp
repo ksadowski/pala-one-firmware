@@ -566,6 +566,40 @@ void handleBLECommand(std::string cmd) {
       } else { sendBLEStatus("invalid_json"); }
     } else { sendBLEStatus("invalid_json"); }
   }
+  else if (command == "GOTO_BEGINNING") {
+    if (g_reader.file && mode == MODE_READER) {
+      g_reader.pageIndex = 0;
+      renderCurrentPage();
+      saveProgress(false);
+      sendBLEStatus("goto_beginning_ok");
+    } else {
+      sendBLEStatus("goto_beginning_error:not_reading");
+    }
+  }
+  else if (command.startsWith("SEARCH:")) {
+    String phrase = command.substring(7);
+    if (g_reader.file && mode == MODE_READER && phrase.length() > 0) {
+      // Search for phrase in the book
+      uint32_t foundOffset = searchInBook(g_reader.file, phrase);
+      if (foundOffset != 0xFFFFFFFF) {
+        // Find which page this offset corresponds to
+        int foundPage = findPageForOffset(g_reader.currentBookPath, foundOffset);
+        if (foundPage >= 0) {
+          g_reader.pageIndex = foundPage;
+          renderCurrentPage();
+          saveProgress(false);
+          String response = "search_found:" + String(foundPage);
+          sendBLEStatus(response.c_str());
+        } else {
+          sendBLEStatus("search_error:page_not_found");
+        }
+      } else {
+        sendBLEStatus("search_not_found");
+      }
+    } else {
+      sendBLEStatus("search_error:not_reading");
+    }
+  }
   else if (command == "CANCEL_TRANSFER") {
     if (g_bleTransferState != BLE_TRANSFER_IDLE) {
       if (g_bleTransferFile) g_bleTransferFile.close();

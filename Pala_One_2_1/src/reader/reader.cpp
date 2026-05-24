@@ -291,6 +291,105 @@ void ensureOffsetsUpTo(int targetPage) {
 }
 
 // ============================================================================
+//  Search / navigation
+// ============================================================================
+uint32_t searchInBook(File& f, const String& phrase) {
+  if (!f || phrase.length() == 0) return 0xFFFFFFFF;
+
+  uint32_t fileSize = f.size();
+  if (fileSize == 0) return 0xFFFFFFFF;
+
+  // Simple linear search - read file in chunks and look for phrase
+  const uint32_t SEARCH_CHUNK_SIZE = 1024;  // Reduced to avoid stack overflow
+  static char buffer[SEARCH_CHUNK_SIZE + 256];  // Static to avoid stack overflow
+  uint32_t offset = 0;
+  int bufferLen = 0;
+  int phraseLen = phrase.length();
+
+  f.seek(0);
+
+  while (offset < fileSize) {
+    // Read chunk, keeping overlap for phrase spanning chunks
+    int toRead = SEARCH_CHUNK_SIZE;
+    if (offset + toRead > fileSize) toRead = fileSize - offset;
+
+    // Shift existing buffer content to handle overlap
+    if (bufferLen > 0 && bufferLen < phraseLen) {
+      memmove(buffer, buffer + SEARCH_CHUNK_SIZE, bufferLen);
+    }
+
+    int readPos = (bufferLen > 0 && bufferLen < phraseLen) ? bufferLen : 0;
+    int bytesRead = f.read((uint8_t*)buffer + readPos, toRead);
+    if (bytesRead <= 0) break;
+
+    bufferLen = readPos + bytesRead;
+
+    // Search for phrase in buffer
+    for (int i = 0; i <= bufferLen - phraseLen; i++) {
+      bool match = true;
+      for (int j = 0; j < phraseLen; j++) {
+        if (buffer[i + j] != phrase[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        // Found phrase - return the absolute file offset
+        uint32_t foundOffset = offset + i - (bufferLen - bytesRead);
+        return foundOffset;
+      }
+    }
+
+    // Keep last (phraseLen - 1) bytes for overlap
+    int keepLen = (phraseLen - 1) < bufferLen ? (phraseLen - 1) : 0;
+    if (keepLen > 0) {
+      memmove(buffer, buffer + bufferLen - keepLen, keepLen);
+      bufferLen = keepLen;
+    } else {
+      bufferLen = 0;
+    }
+
+    offset += bytesRead;
+  }
+
+  return 0xFFFFFFFF;  // Not found
+}
+
+int findPageForOffset(const String& path, uint32_t offset) {
+  // Binary search through page offsets to find the page containing this offset
+  if (g_reader.knownPages < 1) return -1;
+
+  // Ensure we have page offsets loaded
+  if (g_reader.currentBookPath != path) {
+    return -1;
+  }
+
+  // Binary search
+  int low = 0;
+  int high = g_reader.knownPages - 1;
+
+  while (low <= high) {
+    int mid = (low + high) / 2;
+    uint32_t pageOffset = g_reader.pageOffsets[mid];
+
+    if (pageOffset == offset) {
+      return mid;
+    } else if (pageOffset < offset) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  // high is the last page with offset <= target
+  if (high >= 0 && high < g_reader.knownPages) {
+    return high;
+  }
+
+  return -1;
+}
+
+// ============================================================================
 //  Reader open / render
 // ============================================================================
 bool openBookByIndex(int idx) {

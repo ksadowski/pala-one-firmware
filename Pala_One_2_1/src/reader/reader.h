@@ -22,6 +22,10 @@ uint32_t buildNextOffset(uint32_t startPos);
 uint32_t pageOffsetForPage(File& f, const String& path, int page);
 void     ensureOffsetsUpTo(int targetPage);
 
+// ---- Search / navigation ----
+uint32_t searchInBook(File& f, const String& phrase);
+int      findPageForOffset(const String& path, uint32_t offset);
+
 // ---- Reader open / render ----
 bool     openBookByIndex(int idx);
 void     relocateOpenBookToOffset(uint32_t targetOffset);

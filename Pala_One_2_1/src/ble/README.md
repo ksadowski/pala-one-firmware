@@ -169,6 +169,17 @@ If any layout-affecting field changes (`fontSize`, `fontFamily`, `fontWeight`, `
 
 ---
 
+### Navigation Commands
+
+| Command | Description | STATUS response |
+|---|---|---|
+| `GOTO_BEGINNING` | Jump to the first page of the book (displayed as page 1) | `goto_beginning_ok`, `goto_beginning_error:not_reading` |
+| `SEARCH:<phrase>` | Search for phrase in current book and navigate to first match | `search_found:<page>`, `search_not_found`, `search_error:not_reading`, `search_error:page_not_found` |
+
+The search is a linear scan through the file in 1 KB chunks with phrase overlap handling. It returns the page number of the first match. The search is case-sensitive and matches the exact phrase as provided.
+
+---
+
 ### Miscellaneous Commands
 
 | Command | Description | STATUS response |
