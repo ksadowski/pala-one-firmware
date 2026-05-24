@@ -6,6 +6,7 @@
 #include "src/pure/text_util.h"
 #include "src/pure/paths.h"
 #include "src/pure/page_offset_table.h"
+#include "src/pure/paginator.h"
 #include "src/storage/page_cache.h"
 #include "src/storage/progress.h"
 
@@ -75,156 +76,41 @@ void enterLibraryRoot(bool redraw) {
 // ============================================================================
 //  Pagination / text layout
 // ============================================================================
+static int measureWrapper(const char* str) {
+  return u8g2.getUTF8Width(str);
+}
+
+struct LineCallbackData {
+  bool draw;
+  String* outText;
+  int cursorY;
+};
+
+static void lineCallbackWrapper(const char* buf, size_t len, void* userData) {
+  LineCallbackData* data = (LineCallbackData*)userData;
+  if (data->draw) {
+    u8g2.setCursor(MARGIN_X, data->cursorY);
+    u8g2.print(buf);
+    data->cursorY += getMetrics().lineH;
+  }
+  if (data->outText) {
+    (*data->outText) += String(buf);
+    (*data->outText) += "\n";
+  }
+}
+
 uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* outText) {
-  f.seek(startPos);
   u8g2.setFont(MAIN_FONT);
   const LayoutMetrics& m = getMetrics();
 
-  int cursorY  = TOP_PAD + m.ascent;
-  int linesUsed = 0;
+  LineCallbackData data;
+  data.draw = draw;
+  data.outText = outText;
+  data.cursorY = TOP_PAD + m.ascent;
 
-  String line;
-  String token;
-  line.reserve(96);
-  token.reserve(48);
+  LineCallback callback = (draw || outText) ? lineCallbackWrapper : nullptr;
 
-  uint32_t lineStartPos  = startPos;
-  uint32_t tokenStartPos = startPos;
-
-  auto flushLine = [&](const String& toPrint) {
-    String printable = toPrint;
-    trimTrailingSpaces(printable);
-
-    if (draw) {
-      u8g2.setCursor(MARGIN_X, cursorY);
-      u8g2.print(printable.c_str());
-      cursorY += m.lineH;
-    }
-    if (outText) {
-      String t = printable;
-      t.trim();
-      (*outText) += t;
-      (*outText) += "\n";
-    }
-    linesUsed++;
-  };
-
-  auto safeReturn = [&](uint32_t off) -> uint32_t {
-    if (off <= startPos) off = startPos + 1;
-    size_t sz = f.size();
-    if (sz > 0 && off > sz) off = sz;
-    return off;
-  };
-
-  auto hardBreakToken = [&](String& t, uint32_t& tStartPos) -> uint32_t {
-    while (t.length() > 0) {
-      String chunk;
-      chunk.reserve(32);
-      int i = 0;
-      while (i < (int)t.length()) {
-        int clen = utf8SafeCharLenAt(t, i);
-        if (clen <= 0) break;
-        String candidate = chunk + t.substring(i, i + clen);
-        if (u8g2.getUTF8Width(candidate.c_str()) > m.maxWidth) break;
-        chunk = candidate;
-        i += clen;
-      }
-      if (chunk.length() == 0) {
-        int clen = utf8SafeCharLenAt(t, 0);
-        if (clen <= 0) clen = 1;
-        chunk = t.substring(0, clen);
-      }
-      flushLine(chunk);
-      if (linesUsed >= m.maxLines) return safeReturn(tStartPos + (uint32_t)chunk.length());
-      t.remove(0, chunk.length());
-      tStartPos += (uint32_t)chunk.length();
-    }
-    return 0;
-  };
-
-  auto appendTokenToLine = [&](String& t, uint32_t tPos) -> uint32_t {
-    if (t.length() == 0) return 0;
-
-    if (line.length() == 0) {
-      trimLeadingSpaces(t);
-      if (t.length() == 0) return 0;
-      if (u8g2.getUTF8Width(t.c_str()) > m.maxWidth) {
-        return hardBreakToken(t, tPos);
-      }
-      line         = t;
-      lineStartPos = tPos;
-      t            = "";
-      return 0;
-    }
-
-    trimLeadingSpaces(t);
-    if (t.length() == 0) return 0;
-
-    String candidate = line + t;
-    if (u8g2.getUTF8Width(candidate.c_str()) > m.maxWidth) {
-      trimTrailingSpaces(line);
-      flushLine(line);
-      if (linesUsed >= m.maxLines) return safeReturn(tPos);
-
-      if (u8g2.getUTF8Width(t.c_str()) > m.maxWidth) {
-        return hardBreakToken(t, tPos);
-      } else {
-        line         = t;
-        lineStartPos = tPos;
-      }
-    } else {
-      line = candidate;
-    }
-
-    t = "";
-    return 0;
-  };
-
-  while (f.available() && linesUsed < m.maxLines) {
-    uint32_t charPos = f.position();
-    char c = (char)f.read();
-    if (c == '\r') continue;
-
-    String ch;
-    ch += c;
-
-    if (c == '\n') {
-      uint32_t forcedNext = appendTokenToLine(token, tokenStartPos);
-      if (forcedNext != 0) return forcedNext;
-      flushLine(line);
-      if (linesUsed >= m.maxLines) return safeReturn(f.position());
-      line          = "";
-      lineStartPos  = f.position();
-      continue;
-    }
-
-    if (c == '\t') ch = " ";
-
-    if (isBreakableWhitespaceChar(ch)) {
-      uint32_t forcedNext = appendTokenToLine(token, tokenStartPos);
-      if (forcedNext != 0) return forcedNext;
-      if (line.length() > 0 && !lineEndsWithSpace(line)) line += " ";
-      continue;
-    }
-
-    if (token.length() == 0) tokenStartPos = charPos;
-    token += ch;
-
-    if (isBreakablePunctuationChar(ch)) {
-      uint32_t forcedNext = appendTokenToLine(token, tokenStartPos);
-      if (forcedNext != 0) return forcedNext;
-    }
-  }
-
-  uint32_t forcedNext = appendTokenToLine(token, tokenStartPos);
-  if (forcedNext != 0) return forcedNext;
-
-  if (linesUsed < m.maxLines && line.length() > 0) {
-    trimTrailingSpaces(line);
-    flushLine(line);
-  }
-
-  return safeReturn(f.position());
+  return paginatePage(f, startPos, m, measureWrapper, callback, &data);
 }
 
 uint32_t buildNextOffsetFor(File& f, uint32_t startPos) {

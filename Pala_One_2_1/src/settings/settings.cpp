@@ -229,6 +229,10 @@ void loadSettings() {
   if (g_settings.lineGap < 0) g_settings.lineGap = 0;
   if (g_settings.lineGap > 4) g_settings.lineGap = 4;
 
+  g_settings.screensaverType = prefs.getInt("cfg_screensaver", SCREENSAVER_SLEEP_ICON);
+  if (g_settings.screensaverType < 0) g_settings.screensaverType = SCREENSAVER_SLEEP_ICON;
+  if (g_settings.screensaverType > 2) g_settings.screensaverType = SCREENSAVER_SLEEP_ICON;
+
   g_settings.readerLongPressAction = LONGPRESS_BOOKMARK;
   invalidateMetrics();
 }

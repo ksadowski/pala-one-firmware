@@ -168,8 +168,35 @@ void handleBLECommand(std::string cmd) {
         g_uploadPath   = path;
         g_uploadSize   = size;
         g_uploadIsApp  = false;
+        g_uploadIsBinary = false;
         g_initUpload   = true;
         Serial.println("[BLE] Deferred upload initialization to main loop");
+      } else {
+        Serial.println("[BLE] Invalid size");
+        sendBLEStatus("upload_error:invalid_size");
+      }
+    } else {
+      Serial.println("[BLE] Invalid params");
+      sendBLEStatus("upload_error:invalid_params");
+    }
+  }
+  else if (command.startsWith("UPLOAD_BINARY:")) {
+    String params = command.substring(14);
+    Serial.print("[BLE] UPLOAD_BINARY command: ");
+    Serial.println(params);
+    int colonIdx = params.indexOf(':', 1);
+    if (colonIdx > 0) {
+      String path = params.substring(0, colonIdx);
+      uint32_t size = params.substring(colonIdx + 1).toInt();
+      Serial.print("[BLE] Path: "); Serial.println(path);
+      Serial.print("[BLE] Size: "); Serial.println(size);
+      if (size > 0 && size < 10 * 1024 * 1024) {
+        g_uploadPath   = path;
+        g_uploadSize   = size;
+        g_uploadIsApp  = false;
+        g_uploadIsBinary = true;
+        g_initUpload   = true;
+        Serial.println("[BLE] Deferred binary upload initialization to main loop");
       } else {
         Serial.println("[BLE] Invalid size");
         sendBLEStatus("upload_error:invalid_size");
@@ -257,7 +284,8 @@ void handleBLECommand(std::string cmd) {
     json += "\"fontWeight\":"            + String(g_settings.fontWeight)            + ",";
     json += "\"sleepSecs\":"             + String(g_settings.sleepSecs)             + ",";
     json += "\"lineGap\":"               + String(g_settings.lineGap)               + ",";
-    json += "\"readerLongPressAction\":" + String(g_settings.readerLongPressAction);
+    json += "\"readerLongPressAction\":" + String(g_settings.readerLongPressAction) + ",";
+    json += "\"screensaverType\":"       + String(g_settings.screensaverType);
     json += "}";
     if (g_bleCharData && g_bleConnected) {
       g_bleCharData->setValue(json.c_str());
@@ -369,6 +397,24 @@ void handleBLECommand(std::string cmd) {
             prefs.putInt("cfg_lgap", lg);
             invalidateMetrics();
             layoutChanged = true;
+          }
+        }
+      }
+    }
+
+    // Parse screensaverType
+    int sstIdx = settingsJson.indexOf("\"screensaverType\":");
+    if (sstIdx >= 0) {
+      int valStart = sstIdx + 18;
+      int valEnd = settingsJson.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = settingsJson.indexOf('}', valStart);
+      if (valEnd > valStart) {
+        int ss = settingsJson.substring(valStart, valEnd).toInt();
+        if (ss >= 0 && ss <= 2) {
+          if (ss != g_settings.screensaverType) {
+            g_settings.screensaverType = ss;
+            prefs.putInt("cfg_screensaver", ss);
+            Serial.print("[BLE] Changed screensaverType to "); Serial.println(ss);
           }
         }
       }

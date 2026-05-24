@@ -41,6 +41,12 @@ enum ReaderLongPressAction {
   LONGPRESS_BOOKMARK = 0
 };
 
+enum ScreensaverType {
+  SCREENSAVER_NONE = 0,        // No screensaver - leave current page displayed
+  SCREENSAVER_SLEEP_ICON = 1,  // Show sleep icon
+  SCREENSAVER_BLANK = 2        // Clear to white
+};
+
 enum LibraryEntryType {
   LIB_ENTRY_BACK,
   LIB_ENTRY_FOLDER,
@@ -82,6 +88,7 @@ struct RuntimeSettings {
   int readerLongPressAction = LONGPRESS_BOOKMARK;
   int fontFamily = 0;  // 0=atkinson, 1=literata, 2=noto_sans, 3=noto_serif
   int fontWeight = 0;  // 0=regular, 1=medium, 2=semibold, 3=bold, 4=extrabold
+  int screensaverType = SCREENSAVER_SLEEP_ICON;  // Screensaver mode
 };
 
 struct LibraryState {
@@ -291,6 +298,7 @@ extern bool     g_redrawCurrentMode;
 extern bool     g_fetchAllBookmarks;
 extern bool     g_initUpload;
 extern bool     g_uploadIsApp;
+extern bool     g_uploadIsBinary;
 extern String   g_uploadPath;
 extern uint32_t g_uploadSize;
 

@@ -83,11 +83,22 @@ String normalizeTypography(const String& in) {
 }
 
 String compactText(const String& in) {
+  bool lastWasSpace = false;
+  int newlineCount = 0;
+  return compactText(in, &lastWasSpace, &newlineCount, true, true);
+}
+
+String compactText(const String& in,
+                   bool* ioLastWasSpace,
+                   int* ioNewlineCount,
+                   bool trimTail,
+                   bool reflowSingleNewlines) {
   String out;
   out.reserve(in.length());
 
-  bool lastWasSpace = false;
-  int newlineCount = 0;
+  bool lastWasSpace = ioLastWasSpace ? *ioLastWasSpace : false;
+  int newlineCount = ioNewlineCount ? *ioNewlineCount : 0;
+  size_t trimAnchor = out.length();
 
   for (size_t i = 0; i < in.length(); i++) {
     char c = in[i];
@@ -96,15 +107,33 @@ String compactText(const String& in) {
     if (c == '\t') c = ' ';
 
     if (c == '\n') {
-      while (out.length() > 0 && out[out.length() - 1] == ' ') {
-        out.remove(out.length() - 1);
-      }
+      if (out.length() > trimAnchor) out.remove(trimAnchor);
       newlineCount++;
-      if (newlineCount <= 2) out += '\n';
+      if (reflowSingleNewlines) {
+        // Defer until we see what follows. A lone newline becomes a space
+        // (resolved when the next non-newline arrives, below). The second
+        // newline in a run promotes the deferred state to a paragraph break.
+        // 3+ in a run are absorbed into the same break.
+        if (newlineCount == 2) {
+          out += '\n';
+          out += '\n';
+          trimAnchor = out.length();
+        }
+      } else {
+        if (newlineCount <= 2) {
+          out += '\n';
+          trimAnchor = out.length();
+        }
+      }
       lastWasSpace = false;
       continue;
     }
 
+    // Non-newline. If reflow mode left a single \n pending, resolve it as a
+    // space now (we know the run was just one). A run of length >=2 already
+    // emitted its paragraph break above, so nothing more to do.
+    const bool resolveDeferredNewline =
+        reflowSingleNewlines && newlineCount == 1;
     newlineCount = 0;
 
     if (c == ' ') {
@@ -115,14 +144,26 @@ String compactText(const String& in) {
       continue;
     }
 
+    if (resolveDeferredNewline && !lastWasSpace) {
+      out += ' ';
+      // Don't update trimAnchor — this space should still get stripped if a
+      // newline arrives before any non-space character does.
+    }
+
     lastWasSpace = false;
     out += c;
+    trimAnchor = out.length();
   }
 
-  while (out.length() > 0 &&
-         (out[out.length() - 1] == ' ' || out[out.length() - 1] == '\n')) {
-    out.remove(out.length() - 1);
+  if (trimTail) {
+    while (out.length() > 0 &&
+           (out[out.length() - 1] == ' ' || out[out.length() - 1] == '\n')) {
+      out.remove(out.length() - 1);
+    }
   }
+
+  if (ioLastWasSpace) *ioLastWasSpace = lastWasSpace;
+  if (ioNewlineCount) *ioNewlineCount = newlineCount;
 
   return out;
 }

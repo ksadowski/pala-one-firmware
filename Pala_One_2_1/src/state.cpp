@@ -45,6 +45,7 @@ bool     g_redrawCurrentMode = false;
 bool     g_fetchAllBookmarks = false;
 bool     g_initUpload        = false;
 bool     g_uploadIsApp       = false;
+bool     g_uploadIsBinary    = false;
 String   g_uploadPath;
 uint32_t g_uploadSize        = 0;
 

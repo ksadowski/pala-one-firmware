@@ -51,7 +51,11 @@ static void goToSleep() {
   drawSleepScreen();
   delay(600);
 
-  btStop();
+  // Stop BLE advertising before sleep (btStop causes heap corruption)
+  // Deep sleep automatically deinitializes all peripherals including BLE
+  if (g_bleServer) {
+    g_bleServer->getAdvertising()->stop();
+  }
 
   Platform::prepareToSleep();
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
@@ -70,6 +74,12 @@ void setup() {
 
   pinMode(BTN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BTN), btnISR, CHANGE);
+
+  // Configure e-paper control pins as outputs to avoid GPIO warnings
+  // (heltec-eink-modules library should do this, but we do it defensively)
+  pinMode(8, OUTPUT);
+  pinMode(9, OUTPUT);
+  pinMode(10, OUTPUT);
 
   u8g2.begin(gfx);
   initPalaAPI();
@@ -435,6 +445,21 @@ void loop() {
         sendBLEStatus("upload_error:invalid_app");
       }
       g_uploadIsApp = false;
+
+    } else if (g_uploadIsBinary) {
+      // Binary file upload - just rename temp file, no normalization
+      String tmpPath = g_bleTransferPath + ".tmp";
+      String finalPath = g_bleTransferPath;
+      Serial.println("[BLE Upload] Finalizing binary file...");
+
+      if (FS.rename(tmpPath, finalPath)) {
+        Serial.println("[BLE Upload] Binary upload complete");
+        sendBLEStatus("file_upload_complete");
+      } else {
+        FS.remove(tmpPath);
+        sendBLEStatus("upload_error:rename_failed");
+      }
+      g_uploadIsBinary = false;
 
     } else {
       String tmpPath = g_bleTransferPath + ".tmp";

@@ -21,7 +21,24 @@ String utf8CharAt(const String& s, int index);
 bool   isBreakableWhitespaceChar(const String& ch);
 bool   isBreakablePunctuationChar(const String& ch);
 String normalizeTypography(const String& in);
+
+// Compact text for storage: collapse runs of spaces, normalize line endings,
+// strip trailing whitespace. By default, reflows single newlines to spaces
+// and treats two-or-more newlines as a single paragraph break — matching
+// markdown/EPUB/word-processor conventions so hard-wrapped plain text reads
+// the way the author intended. Pass `reflowSingleNewlines=false` to keep
+// every source newline as a forced line break (poetry, lists, code).
 String compactText(const String& in);
+
+// Streaming overload. Carries `lastWasSpace` and `newlineCount` across calls
+// for chunked processing. Returns the compacted chunk; state persists via
+// the out-parameters.
+String compactText(const String& in,
+                   bool* ioLastWasSpace,
+                   int* ioNewlineCount,
+                   bool trimTail,
+                   bool reflowSingleNewlines = true);
+
 String readBookmarkLabelAtOffset(File& f, uint32_t off, int page);
 void   trimTrailingSpaces(String& s);
 void   trimLeadingSpaces(String& s);

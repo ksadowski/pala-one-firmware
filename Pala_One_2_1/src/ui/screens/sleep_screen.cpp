@@ -4,21 +4,40 @@
 #include "pala_one_sleep_black_icon_v4.h"
 
 void drawSleepScreen() {
-  display.fastmodeOff();
-  display.clear();
-  beginPageCanvas();
+  switch (g_settings.screensaverType) {
+    case SCREENSAVER_NONE:
+      // No screensaver - leave current page displayed
+      // Device still goes to sleep normally, just don't change display
+      break;
 
-  File sf = FS.open("/sleep.bin", "r");
-  if (sf && sf.size() >= 3904) {
-    static uint8_t sleepBuf[3904];
-    sf.read(sleepBuf, 3904);
-    sf.close();
-    gfx.fillScreen(1);
-    gfx.drawXBitmap(0, 0, sleepBuf, SCREEN_W, SCREEN_H, 0);
-  } else {
-    if (sf) sf.close();
-    gfx.fillScreen(1);
-    gfx.drawXBitmap(0, 0, pala_one_sleep_black_icon_v4_bits, SCREEN_W, SCREEN_H, 0);
+    case SCREENSAVER_BLANK:
+      // Clear to white
+      display.fastmodeOff();
+      display.clear();
+      beginPageCanvas();
+      gfx.fillScreen(1);
+      display.update();
+      break;
+
+    case SCREENSAVER_SLEEP_ICON:
+    default:
+      // Draw sleep icon (default behavior)
+      display.fastmodeOff();
+      display.clear();
+      beginPageCanvas();
+      File sf = FS.open("/sleep.bin", "r");
+      if (sf && sf.size() >= 3904) {
+        static uint8_t sleepBuf[3904];
+        sf.read(sleepBuf, 3904);
+        sf.close();
+        gfx.fillScreen(1);
+        gfx.drawXBitmap(0, 0, sleepBuf, SCREEN_W, SCREEN_H, 0);
+      } else {
+        if (sf) sf.close();
+        gfx.fillScreen(1);
+        gfx.drawXBitmap(0, 0, pala_one_sleep_black_icon_v4_bits, SCREEN_W, SCREEN_H, 0);
+      }
+      display.update();
+      break;
   }
-  display.update();
 }
