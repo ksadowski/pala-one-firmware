@@ -1,0 +1,6 @@
+#ifndef PALA_UI_SCREENS_SLEEP_SCREEN_H
+#define PALA_UI_SCREENS_SLEEP_SCREEN_H
+
+void drawSleepScreen();
+
+#endif // PALA_UI_SCREENS_SLEEP_SCREEN_H

@@ -4,6 +4,7 @@
 #include "src/settings/settings.h"
 #include "src/storage/page_cache.h"
 #include "src/storage/progress.h"
+#include "src/storage/library.h"
 #include "src/storage/app_catalog.h"
 #include "src/pure/paths.h"
 #include "src/pure/text_util.h"
@@ -599,6 +600,7 @@ void handleBLECommand(std::string cmd) {
       }
       if (FS.remove(path)) {
         if (path.startsWith("/books/")) {
+          deleteBookMetadata(path);
           g_reloadLibrary = true;
           sendBLEStatus("file_delete_success");
           Serial.println("[BLE] File removed successfully, deferred library reload");

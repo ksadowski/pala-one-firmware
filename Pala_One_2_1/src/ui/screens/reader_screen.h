@@ -1,0 +1,6 @@
+#ifndef PALA_UI_SCREENS_READER_SCREEN_H
+#define PALA_UI_SCREENS_READER_SCREEN_H
+
+void handleModeReader();
+
+#endif // PALA_UI_SCREENS_READER_SCREEN_H
