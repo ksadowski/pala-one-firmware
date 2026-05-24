@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PALA_APP_H
+#define PALA_APP_H
 #include <stdint.h>
 
 #define PALA_APP_MAGIC    0x50414C41UL  // 'PALA'
@@ -22,3 +23,5 @@ typedef struct {
 
 // Entry point signature
 typedef void (*pala_app_entry_t)(const void* api);
+
+#endif // PALA_APP_H

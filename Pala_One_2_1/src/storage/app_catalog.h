@@ -1,0 +1,6 @@
+#ifndef PALA_STORAGE_APP_CATALOG_H
+#define PALA_STORAGE_APP_CATALOG_H
+
+void scanApps();
+
+#endif // PALA_STORAGE_APP_CATALOG_H

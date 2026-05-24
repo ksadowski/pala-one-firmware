@@ -1,4 +1,5 @@
-#pragma once
+#ifndef PALA_API_H
+#define PALA_API_H
 #include <stdint.h>
 #include <stdarg.h>
 
@@ -21,3 +22,5 @@ typedef struct {
     int      (*storageWrite)(const char* key, const void* buf, int len);     // write to /apps/{key}.dat; returns bytes written, -1 on error
     uint32_t (*rtcSeconds)  (void);                                          // monotonic seconds; survives deep sleep; use for cross-session timing
 } PalaAPI;
+
+#endif // PALA_API_H
