@@ -1,16 +1,20 @@
 #ifndef PALA_HAL_DISPLAY_H
 #define PALA_HAL_DISPLAY_H
 
-// ── Board selection: uncomment the line that matches your hardware ──────────
-//#define BOARD_V1_1
-#define BOARD_V1_2
+// ── Board selection ──────────────────────────────────────────────────────────
+// PlatformIO: set via build_flags (-D DISPLAY_V1_1 or -D DISPLAY_V1_2).
+// Arduino IDE: uncomment one of the lines below.
+//#define DISPLAY_V1_1
+#if !defined(DISPLAY_V1_1) && !defined(DISPLAY_V1_2) && !defined(BOARD_V1_1) && !defined(BOARD_V1_2)
+  #define DISPLAY_V1_2
+#endif
 // ────────────────────────────────────────────────────────────────────────────
 
 #include <heltec-eink-modules.h>
 #include <Adafruit_GFX.h>
 #include "src/config.h"
 
-#ifdef BOARD_V1_1
+#if defined(DISPLAY_V1_1) || defined(BOARD_V1_1)
   using DisplayType = EInkDisplay_WirelessPaperV1_1;
 #else
   using DisplayType = EInkDisplay_WirelessPaperV1_2;

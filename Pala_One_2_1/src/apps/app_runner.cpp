@@ -88,7 +88,7 @@ static uint32_t api_pendingPresses() {
 }
 
 static uint32_t api_rtcSeconds() {
-  return (uint32_t)(esp_rtc_get_time_us() / 1000000ULL);
+  return (uint32_t)(esp_timer_get_time() / 1000000ULL);
 }
 
 static int api_storageRead(const char* key, void* buf, int maxlen) {

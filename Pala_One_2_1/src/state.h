@@ -7,7 +7,6 @@
 #include <Adafruit_GFX.h>
 #include <U8g2_for_Adafruit_GFX.h>
 #include <esp_timer.h>
-#include <esp_rtc_time.h>
 #include <esp_bt.h>
 #include <esp_sleep.h>
 #include <esp_heap_caps.h>
