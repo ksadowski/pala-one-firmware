@@ -52,7 +52,7 @@ uint32_t paginatePage(File& f,
   };
 
   auto safeReturn = [&](uint32_t off) -> uint32_t {
-    if (off <= startPos) off = startPos + 1;
+    if (off < startPos) off = startPos + 1;
     size_t sz = f.size();
     if (sz > 0 && off > sz) off = (uint32_t)sz;
     return off;
@@ -196,5 +196,6 @@ uint32_t paginatePage(File& f,
     flushLine();
   }
 
-  return safeReturn(f.position());
+  uint32_t finalPos = f.position();
+  return safeReturn(finalPos);
 }

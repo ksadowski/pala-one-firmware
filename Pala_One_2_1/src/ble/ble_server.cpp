@@ -569,6 +569,7 @@ void handleBLECommand(std::string cmd) {
   else if (command == "GOTO_BEGINNING") {
     if (g_reader.file && mode == MODE_READER) {
       g_reader.pageIndex = 0;
+      g_reader.knownPages = 0;
       renderCurrentPage();
       saveProgress(false);
       sendBLEStatus("goto_beginning_ok");

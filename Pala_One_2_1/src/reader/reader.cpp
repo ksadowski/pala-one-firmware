@@ -100,6 +100,8 @@ static void lineCallbackWrapper(const char* buf, size_t len, void* userData) {
 }
 
 uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* outText) {
+  Serial.print("[PAG] readPageFromFile startPos=");
+  Serial.println(startPos);
   u8g2.setFont(MAIN_FONT);
   const LayoutMetrics& m = getMetrics();
 
@@ -224,10 +226,19 @@ uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* outText
   // Return current file position - this is where we stopped reading
   // The pending word (if any) was already read but not rendered, so it will be
   // rendered on the next page when we seek back to its start
+  uint32_t nextPos;
   if (wordLen > 0) {
-    return wordStartPos;
+    nextPos = wordStartPos;
+  } else {
+    nextPos = f.position();
   }
-  return f.position();
+  Serial.print("[PAG] readPageFromFile returning: linesUsed=");
+  Serial.print(linesUsed);
+  Serial.print(" wordLen=");
+  Serial.print(wordLen);
+  Serial.print(" nextPos=");
+  Serial.println(nextPos);
+  return nextPos;
 }
 
 uint32_t buildNextOffsetFor(File& f, uint32_t startPos) {
