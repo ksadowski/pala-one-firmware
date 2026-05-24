@@ -103,14 +103,131 @@ uint32_t readPageFromFile(File& f, uint32_t startPos, bool draw, String* outText
   u8g2.setFont(MAIN_FONT);
   const LayoutMetrics& m = getMetrics();
 
-  LineCallbackData data;
-  data.draw = draw;
-  data.outText = outText;
-  data.cursorY = TOP_PAD + m.ascent;
+  // Simple greedy pagination - fill lines as much as possible
+  char lineBuf[256];
+  char wordBuf[128];
+  int lineLen = 0;      // Character count in line buffer
+  int lineWidth = 0;    // Pixel width of current line
+  int wordLen = 0;      // Character count in word buffer
+  int linesUsed = 0;
+  int cursorY = TOP_PAD + m.ascent;
+  const int spaceWidth = measureWrapper(" ");
 
-  LineCallback callback = (draw || outText) ? lineCallbackWrapper : nullptr;
+  uint32_t wordStartPos = startPos;  // Track where current word starts in file
 
-  return paginatePage(f, startPos, m, measureWrapper, callback, &data);
+  f.seek(startPos);
+
+  while (linesUsed < m.maxLines) {
+    uint32_t charPos = f.position();
+    int c = f.read();
+    if (c < 0) break;
+
+    // Handle whitespace
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      if (wordLen > 0) {
+        // Word complete - try to add to current line
+        wordBuf[wordLen] = 0;
+        int wordWidth = measureWrapper(wordBuf);
+        int neededWidth = wordWidth;
+        if (lineLen > 0) neededWidth += spaceWidth;
+
+        if (lineLen == 0 || (lineWidth + neededWidth <= m.maxWidth)) {
+          // Add to current line
+          if (lineLen > 0) {
+            lineBuf[lineLen++] = ' ';
+            lineWidth += spaceWidth;
+          }
+          for (int i = 0; i < wordLen; i++) {
+            lineBuf[lineLen++] = wordBuf[i];
+          }
+          lineWidth += wordWidth;
+          wordLen = 0;  // Word consumed
+        } else {
+          // Flush current line and start new line
+          lineBuf[lineLen] = 0;
+          if (draw) {
+            u8g2.setCursor(MARGIN_X, cursorY);
+            u8g2.print(lineBuf);
+          }
+          if (outText) {
+            (*outText) += String(lineBuf);
+            (*outText) += "\n";
+          }
+          cursorY += m.lineH;
+          linesUsed++;
+
+          // Check if we've filled the page after flushing
+          if (linesUsed >= m.maxLines) {
+            // Word stays in wordBuf for next page - don't consume it
+            break;
+          }
+
+          // Start new line with this word
+          lineLen = wordLen;
+          lineWidth = wordWidth;
+          for (int i = 0; i < wordLen; i++) {
+            lineBuf[i] = wordBuf[i];
+          }
+          wordLen = 0;  // Word consumed (moved to lineBuf)
+        }
+      }
+
+      // Handle newlines as forced line breaks
+      if (c == '\n') {
+        if (lineLen > 0) {
+          lineBuf[lineLen] = 0;
+          if (draw) {
+            u8g2.setCursor(MARGIN_X, cursorY);
+            u8g2.print(lineBuf);
+          }
+          if (outText) {
+            (*outText) += String(lineBuf);
+            (*outText) += "\n";
+          }
+          cursorY += m.lineH;
+          linesUsed++;
+          lineLen = 0;
+          lineWidth = 0;
+
+          // Check if we've filled the page after newline
+          if (linesUsed >= m.maxLines) {
+            break;
+          }
+        }
+      }
+    } else {
+      // Add character to word buffer
+      if (wordLen < 127) {
+        if (wordLen == 0) {
+          wordStartPos = charPos;  // Remember where this word starts
+        }
+        wordBuf[wordLen++] = (char)c;
+      }
+    }
+  }
+
+  // Flush final line
+  if (lineLen > 0 && linesUsed < m.maxLines) {
+    lineBuf[lineLen] = 0;
+    if (draw) {
+      u8g2.setCursor(MARGIN_X, cursorY);
+      u8g2.print(lineBuf);
+    }
+    if (outText) {
+      (*outText) += String(lineBuf);
+      (*outText) += "\n";
+    }
+    linesUsed++;
+  }
+
+  // Return the position where the next page should start
+  // Return current file position - this is where we stopped reading
+  // The pending word (if any) was already read but not rendered, so it will be
+  // rendered on the next page when we seek back to its start
+  if (wordLen > 0) {
+    return wordStartPos;
+  }
+  return f.position();
 }
 
 uint32_t buildNextOffsetFor(File& f, uint32_t startPos) {
